@@ -1,0 +1,115 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { openDatabase, type SynapseDatabase } from '../db/connection.js';
+import { migrate } from '../db/schema.js';
+import { insertEntity, insertRelation, upsertVector } from '../db/queries.js';
+import { FakeEmbedder, FailingEmbedder } from '../../test/helpers/fake-embedder.js';
+import { hybridSearch } from './hybrid-search.js';
+
+let db: SynapseDatabase;
+const embedder = new FakeEmbedder();
+
+const A_SCOPE = 'proj:demo/dir:src/file:alpha.ts';
+const B_SCOPE = 'proj:demo/dir:src/file:beta.ts';
+const SYM_SCOPE = 'proj:demo/dir:src/file:alpha.ts/sym:validate';
+const MEM_SCOPE = 'proj:demo/dir:src/file:alpha.ts';
+
+const CONTENT_A = 'token validation logic with authorization checks';
+const CONTENT_B = 'database connection pool with query caching';
+const CONTENT_SYM = 'function validate()';
+const CONTENT_MEM = 'always validate tokens before trusting them';
+
+beforeAll(async () => {
+  db = await openDatabase(':memory:');
+  migrate(db);
+  insertEntity(db, { id: 'a', type: 'file', scopePath: A_SCOPE, name: 'alpha.ts', content: CONTENT_A });
+  insertEntity(db, { id: 'b', type: 'file', scopePath: B_SCOPE, name: 'beta.ts', content: CONTENT_B });
+  insertEntity(db, { id: 'sym', type: 'symbol', scopePath: SYM_SCOPE, name: 'validate', content: CONTENT_SYM });
+  insertEntity(db, { id: 'mem', type: 'memory_entry', scopePath: MEM_SCOPE, name: 'auth note', content: CONTENT_MEM });
+  insertRelation(db, { sourceId: 'a', targetId: 'sym', relation: 'CONTAINS' });
+  for (const [id, text] of [
+    ['a', CONTENT_A],
+    ['b', CONTENT_B],
+    ['sym', CONTENT_SYM],
+    ['mem', CONTENT_MEM],
+  ] as const) {
+    upsertVector(db, id, await embedder.embed(text));
+  }
+});
+
+afterAll(() => {
+  db.close();
+});
+
+describe('hybridSearch', () => {
+  it('returns lexical matches for exact terms', async () => {
+    const out = await hybridSearch(db, embedder, { query: 'token validation', limit: 10 });
+    expect(out.warnings).toEqual([]); // semantic retrieval must not silently degrade here
+    const ids = out.results.map((r) => r.entity.id);
+    expect(ids).toContain('a');
+    expect(ids).toContain('sym');
+    expect(ids).toContain('mem');
+    expect(out.results[0]!.score).toBeGreaterThan(0);
+  });
+
+  it('ranks semantic matches above unrelated files', async () => {
+    const out = await hybridSearch(db, embedder, { query: 'validate tokens', vectorWeight: 2, lexicalWeight: 0, limit: 10 });
+    const ids = out.results.map((r) => r.entity.id);
+    const idxA = ids.indexOf('a');
+    const idxB = ids.indexOf('b');
+    expect(idxA).toBeGreaterThanOrEqual(0);
+    expect(idxA).toBeLessThan(idxB);
+    expect(out.vectorRetrievalUsed).toBe(true);
+  });
+
+  it('fuses fts and vector ranks with RRF', async () => {
+    const out = await hybridSearch(db, embedder, { query: 'token validation', lexicalWeight: 1, vectorWeight: 1, limit: 10 });
+    const a = out.results.find((r) => r.entity.id === 'a');
+    expect(a).toBeDefined();
+    expect(a!.ranks.fts).not.toBeNull();
+    expect(a!.ranks.vector).not.toBeNull();
+    // RRF term: 1/61 for rank 1 with k=60
+    expect(a!.score).toBeGreaterThan(0.016);
+  });
+
+  it('applies scope filters', async () => {
+    const out = await hybridSearch(db, embedder, { query: 'validate tokens', scopes: [B_SCOPE], limit: 10 });
+    expect(out.results.length).toBeGreaterThan(0);
+    expect(out.results.every((r) => r.entity.id === 'b')).toBe(true);
+  });
+
+  it('applies type filters', async () => {
+    const out = await hybridSearch(db, embedder, { query: 'validate tokens', types: ['symbol'], limit: 10 });
+    expect(out.results.length).toBeGreaterThan(0);
+    expect(out.results.every((r) => r.entity.type === 'symbol')).toBe(true);
+  });
+
+  it('expands graph neighbors of seeds (CONTAINS edge)', async () => {
+    // 'authorization' matches only file a; the symbol is reachable via CONTAINS.
+    const out = await hybridSearch(db, embedder, { query: 'authorization', lexicalWeight: 1, vectorWeight: 0, graphWeight: 1, limit: 10 });
+    const ids = out.results.map((r) => r.entity.id);
+    expect(ids).toContain('a');
+    const sym = out.results.find((r) => r.entity.id === 'sym');
+    expect(sym).toBeDefined();
+    expect(sym!.ranks.graph).not.toBeNull();
+    expect(sym!.graphPaths.length).toBeGreaterThan(0);
+  });
+
+  it('degrades gracefully when the embedder is unavailable', async () => {
+    const out = await hybridSearch(db, new FailingEmbedder(), { query: 'token validation', limit: 10 });
+    expect(out.vectorRetrievalUsed).toBe(false);
+    expect(out.warnings.length).toBeGreaterThan(0);
+    expect(out.results.length).toBeGreaterThan(0); // lexical path still works
+  });
+
+  it('reports matched scopes for multi-prefix queries', async () => {
+    const out = await hybridSearch(db, embedder, {
+      query: 'validate tokens',
+      scopes: ['proj:demo/dir:src/file:alpha.ts', 'proj:demo/dir:src/file:beta.ts'],
+      limit: 10,
+    });
+    for (const result of out.results) {
+      expect(result.matchedScopes.length).toBeGreaterThan(0);
+    }
+  });
+});

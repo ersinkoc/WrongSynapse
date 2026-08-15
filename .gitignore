@@ -1,0 +1,30 @@
+.wrongstack/
+!/.wrongstack/
+/.wrongstack/*
+!/.wrongstack/project.json
+
+
+# dependencies
+node_modules/
+
+# build output
+dist/
+*.tsbuildinfo
+
+# local database + index artifacts
+*.db
+*.db-wal
+*.db-shm
+
+# model cache / offline artifacts
+models/
+.cache/
+
+# tests
+coverage/
+
+# agent helper scripts
+.temp_files/
+
+.dfmt/
+.claude/

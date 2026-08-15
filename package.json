@@ -1,0 +1,72 @@
+{
+  "name": "wrongsynapse",
+  "version": "0.1.0",
+  "description": "Local-first Cognitive Memory Operating System and MCP server for autonomous AI coding agents. Tri-hybrid retrieval: ONNX semantic embeddings + SQLite FTS5/BM25 + hierarchical knowledge graph, fused with Reciprocal Rank Fusion. Zero cloud.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "wrongsynapse": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "mcp",
+    "memory",
+    "cognitive-memory",
+    "rag",
+    "vector-search",
+    "fts5",
+    "bm25",
+    "knowledge-graph",
+    "sqlite",
+    "embeddings",
+    "tree-sitter",
+    "local-first"
+  ],
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "better-sqlite3": "^13.0.3",
+    "ignore": "^7.0.6",
+    "simple-git": "^3.36.0",
+    "tree-sitter-go": "^0.25.0",
+    "tree-sitter-javascript": "^0.25.0",
+    "tree-sitter-python": "^0.25.0",
+    "tree-sitter-rust": "^0.24.0",
+    "tree-sitter-typescript": "^0.23.2",
+    "web-tree-sitter": "^0.26.12",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "protobufjs": "^7.6.5",
+    "sharp": "^0.35.3",
+    "adm-zip": "^0.6.0"
+  }
+}
