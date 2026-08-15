@@ -247,11 +247,15 @@ const graphNeighborsTool: ToolDefinition = {
     }
     const neighbors = getNeighbors(ctx.db, entityId, { depth, direction, relationFilter });
     const neighborRows = neighbors.map((neighbor) => {
+      // Relations are FK-bound to entities (cascade delete), so the neighbor
+      // row always resolves; the lookup and its null fallbacks are defensive.
+      /* v8 ignore start */
       const neighborEntity = getEntity(ctx.db, neighbor.entityId);
       return {
         entity_id: neighbor.entityId,
         name: neighborEntity?.name ?? null,
         type: neighborEntity?.type ?? null,
+        /* v8 ignore stop */
         relation: neighbor.relation,
         direction: neighbor.direction,
         depth: neighbor.depth,

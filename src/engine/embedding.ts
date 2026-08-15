@@ -68,6 +68,8 @@ function vectorsFromTensor(tensor: Tensor, expected: number): Float32Array[] {
   const data = tensorData(tensor);
   const dims = tensor.dims;
   if (dims.length <= 1) return [normalizeInPlace(data.slice())];
+  // dims.length >= 2 here, so index 0 is always present.
+  /* v8 ignore next */
   const n = dims[0] ?? 1;
   const rest = dims.slice(1);
   const per = rest.reduce((a, b) => a * b, 1);

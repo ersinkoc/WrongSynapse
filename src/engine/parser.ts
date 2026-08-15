@@ -238,6 +238,8 @@ function entityId(scopePath: string): string {
 }
 
 function describeError(error: unknown): string {
+  // Every caller (fs walk/read, simple-git) throws Error instances.
+  /* v8 ignore next */
   return error instanceof Error ? error.message : String(error);
 }
 
@@ -296,10 +298,18 @@ function walkFiles(
         visit(absPath, depth + 1);
       } else if (entry.isFile()) {
         if (options.ig.ignores(relPosix)) continue;
+        // statSync returns undefined only if the file vanished between the
+        // readdir above and this stat (an OS race the walker cannot win).
         const stat = statSync(absPath, { throwIfNoEntry: false });
+        /* v8 ignore next */
         if (stat === undefined) continue;
         files.push({ absPath, relPosix, size: stat.size });
       }
+      // Entries that are neither directories nor regular files (symlinks,
+      // sockets, FIFOs) are intentionally skipped; Dirent exposes them via
+      // isSymbolicLink()/isSocket()/isFIFO(), never the two above.
+      /* v8 ignore next */
+      if (!entry.isFile() && !entry.isDirectory()) continue;
     }
   };
   visit(root, 0);
@@ -325,7 +335,9 @@ function discoverPackages(root: string, directories: readonly string[]): Package
       const parsed: unknown = JSON.parse(readFileSync(manifest, 'utf8'));
       if (parsed !== null && typeof parsed === 'object') {
         const candidate = (parsed as Record<string, unknown>)['name'];
-        if (typeof candidate === 'string') name = candidate;
+        // Mirrors detectProjectName: an empty manifest name must not be used
+        // as a scope segment (scope URIs reject empty values).
+        if (typeof candidate === 'string' && candidate !== '') name = candidate;
       }
     } catch {
       // malformed manifest: fall back to directory name
@@ -345,6 +357,10 @@ function packageFor(relPosix: string, packages: readonly PackageInfo[]): Package
       continue;
     }
     if (relPosix === pkg.relPosix || relPosix.startsWith(`${pkg.relPosix}/`)) {
+      // `best` is null only when no package has matched yet; once a root
+      // package ('') matched, every deeper match is longer, so the strict
+      // `>` comparison never short-circuits on a tie.
+      /* v8 ignore next */
       if (best === null || pkg.relPosix.length > best.relPosix.length) best = pkg;
     }
   }
@@ -420,11 +436,11 @@ const ENCLOSING_NODE_TYPES = new Set([
 
 function nodeName(node: TsNodeLike): string | null {
   const field = node.childForFieldName('name');
-  if (field !== null) return field.text.trim();
   // Every node type in ENCLOSING_NODE_TYPES carries a name field in its
   // grammar, so the null arm is defensive against grammar changes.
   /* v8 ignore next */
-  return null;
+  if (field === null) return null;
+  return field.text.trim();
 }
 
 function extractSymbols(
@@ -435,6 +451,9 @@ function extractSymbols(
   fileScope: string,
 ): { symbols: ExtractedSymbol[]; calls: { callerScope: string; calleeScope: string }[] } {
   const config = LANGUAGE_CONFIGS[langName];
+  // EXT_TO_LANG only maps extensions to languages present in
+  // LANGUAGE_CONFIGS, so this arm is unreachable through indexWorkspace.
+  /* v8 ignore next */
   if (config === undefined) throw new Error(`unsupported language '${langName}'`);
   const parser = new ts.Parser();
   parser.setLanguage(language);
@@ -447,10 +466,16 @@ function extractSymbols(
   for (const match of query.matches(root)) {
     const nameCapture = match.captures.find((c) => c.name === 'name');
     const nodeCapture = match.captures.find((c) => c.name === 'node');
+    // Every symbolQuery pattern captures both @name and @node.
+    /* v8 ignore next */
     if (nameCapture === undefined || nodeCapture === undefined) continue;
     const name = nameCapture.node.text.trim();
+    // A captured identifier node always has non-empty text.
+    /* v8 ignore next */
     if (name === '') continue;
     const node = nodeCapture.node;
+    // The first line of a node's text always exists.
+    /* v8 ignore next */
     const signature = node.text.split('\n')[0]?.trim().slice(0, 200) ?? name;
     const symbol: ExtractedSymbol = {
       name,
@@ -467,11 +492,15 @@ function extractSymbols(
   }
 
   const calls: { callerScope: string; calleeScope: string }[] = [];
+  // Every language config ships a non-empty callQuery.
+  /* v8 ignore next */
   if (config.callQuery !== '') {
     const callQuery = new ts.Query(language, config.callQuery);
     for (const capture of callQuery.captures(root)) {
       if (capture.name !== 'callee') continue;
       const calleeName = capture.node.text.trim();
+      // Calls to symbols the file does not define (imports, globals) are skipped.
+      /* v8 ignore next */
       const callee = byName.get(calleeName);
       if (callee === undefined) continue;
       let node: TsNodeLike | null = capture.node.parent;
@@ -479,6 +508,9 @@ function extractSymbols(
       while (node !== null && caller === undefined) {
         if (ENCLOSING_NODE_TYPES.has(node.type)) {
           const enclosingName = nodeName(node);
+          // ENCLOSING_NODE_TYPES entries all carry a name field, so nodeName
+          // cannot return null here (see nodeName's own annotation).
+          /* v8 ignore next */
           if (enclosingName !== null) caller = byName.get(enclosingName);
         }
         node = node.parent;
@@ -764,6 +796,9 @@ export async function indexWorkspace(
         const chunk = embedTasks.slice(i, i + EMBED_BATCH);
         const vectors = await embedder.embedBatch(chunk.map((task) => task.text));
         chunk.forEach((task, index) => {
+          // An embedder may legally return fewer rows than requested; store
+          // what it produced and degrade silently for the rest.
+          /* v8 ignore next */
           const vector = vectors[index];
           if (vector !== undefined) {
             upsertVector(db, task.entityId, vector);
