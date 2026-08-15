@@ -492,32 +492,30 @@ function extractSymbols(
   }
 
   const calls: { callerScope: string; calleeScope: string }[] = [];
-  // Every language config ships a non-empty callQuery.
-  /* v8 ignore next */
-  if (config.callQuery !== '') {
-    const callQuery = new ts.Query(language, config.callQuery);
-    for (const capture of callQuery.captures(root)) {
-      if (capture.name !== 'callee') continue;
-      const calleeName = capture.node.text.trim();
-      // Calls to symbols the file does not define (imports, globals) are skipped.
-      /* v8 ignore next */
-      const callee = byName.get(calleeName);
-      if (callee === undefined) continue;
-      let node: TsNodeLike | null = capture.node.parent;
-      let caller: ExtractedSymbol | undefined;
-      while (node !== null && caller === undefined) {
-        if (ENCLOSING_NODE_TYPES.has(node.type)) {
-          const enclosingName = nodeName(node);
-          // ENCLOSING_NODE_TYPES entries all carry a name field, so nodeName
-          // cannot return null here (see nodeName's own annotation).
-          /* v8 ignore next */
-          if (enclosingName !== null) caller = byName.get(enclosingName);
-        }
-        node = node.parent;
+  // Every language config ships a non-empty callQuery, so the query below
+  // always runs and its captures are always measured by the coverage gate.
+  const callQuery = new ts.Query(language, config.callQuery);
+  for (const capture of callQuery.captures(root)) {
+    if (capture.name !== 'callee') continue;
+    const calleeName = capture.node.text.trim();
+    // Calls to symbols the file does not define (imports, globals) are skipped.
+    /* v8 ignore next */
+    const callee = byName.get(calleeName);
+    if (callee === undefined) continue;
+    let node: TsNodeLike | null = capture.node.parent;
+    let caller: ExtractedSymbol | undefined;
+    while (node !== null && caller === undefined) {
+      if (ENCLOSING_NODE_TYPES.has(node.type)) {
+        const enclosingName = nodeName(node);
+        // ENCLOSING_NODE_TYPES entries all carry a name field, so nodeName
+        // cannot return null here (see nodeName's own annotation).
+        /* v8 ignore next */
+        if (enclosingName !== null) caller = byName.get(enclosingName);
       }
-      if (caller !== undefined && caller.scopePath !== callee.scopePath) {
-        calls.push({ callerScope: caller.scopePath, calleeScope: callee.scopePath });
-      }
+      node = node.parent;
+    }
+    if (caller !== undefined && caller.scopePath !== callee.scopePath) {
+      calls.push({ callerScope: caller.scopePath, calleeScope: callee.scopePath });
     }
   }
   return { symbols, calls };

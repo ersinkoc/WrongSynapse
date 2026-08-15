@@ -100,6 +100,18 @@ describe('indexWorkspace option arms', () => {
     expect(files.map((f) => f.name)).toContain('e.ts');
   });
 
+  it('uses a nested manifest name as the package scope and falls back to the directory for nameless ones', async () => {
+    await indexWorkspace(db, embedder, { workspacePath: monorepo });
+    const packages = findEntitiesByScope(db, { scopePrefixes: ['proj:mono-root'], types: ['package'] }).map(
+      (p) => p.name,
+    );
+    expect(packages).toContain('@mono/core'); // nested manifest name wins
+    expect(packages).toContain('anon'); // nameless nested manifest -> basename
+    // Files inside a named nested package scope use the package's name.
+    const m = findEntitiesByScope(db, { scopePrefixes: ['proj:mono-root/pkg:@mono/core'], types: ['file'] });
+    expect(m.map((f) => f.name)).toContain('m.ts');
+  });
+
   it('skips the embedding pass when no content produces embed tasks', async () => {
     // maxFileBytes: 0 makes every file oversized -> content '' -> no embed
     // tasks, so the `embedTasks.length > 0` false arm is exercised.
