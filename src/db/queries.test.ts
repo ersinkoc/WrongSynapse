@@ -11,6 +11,7 @@ import {
   dbStats,
   deleteStaleIndexedEntities,
   deleteVector,
+  findEntitiesByScope,
   getVectors,
   insertCandidate,
   insertEntity,
@@ -97,5 +98,31 @@ describe('deleteStaleIndexedEntities (boundary regression)', () => {
     indexedEntity('my-xapp-file', 'proj:myXapp/file:y.ts');
     const deleted = deleteStaleIndexedEntities(db, 'proj:my_app', ['file'], new Set());
     expect(deleted).toBe(1); // underscore prefix must not match proj:myXapp
+  });
+});
+
+describe('findEntitiesByScope / getVectors (boundary-aware prefixes)', () => {
+  beforeAll(() => {
+    insertEntity(db, { id: 'pfx-in', type: 'file', scopePath: 'proj:pfx/file:a.ts', name: 'a.ts', content: 'x' });
+    insertEntity(db, { id: 'pfx-deep', type: 'file', scopePath: 'proj:pfx/dir:src/file:b.ts', name: 'b.ts', content: 'y' });
+    insertEntity(db, { id: 'pfx-sibling', type: 'file', scopePath: 'proj:pfx2/file:c.ts', name: 'c.ts', content: 'z' });
+    for (const id of ['pfx-in', 'pfx-deep', 'pfx-sibling']) {
+      const vec = new Float32Array(4).fill(0.5);
+      db.prepare('INSERT INTO entity_vectors (entity_id, embedding) VALUES (?, ?)').run(id, Buffer.from(vec.buffer));
+    }
+  });
+
+  it('findEntitiesByScope excludes sibling scopes and includes descendants', () => {
+    const found = findEntitiesByScope(db, { scopePrefixes: ['proj:pfx'], types: ['file'] }).map((e) => e.id);
+    expect(found).toContain('pfx-in');
+    expect(found).toContain('pfx-deep'); // '/'-rooted descendant still matches
+    expect(found).not.toContain('pfx-sibling'); // proj:pfx2 must NOT match proj:pfx
+  });
+
+  it('getVectors excludes sibling scopes and includes descendants', () => {
+    const ids = getVectors(db, { scopePrefixes: ['proj:pfx'], types: ['file'] }).map((v) => v.entityId);
+    expect(ids).toContain('pfx-in');
+    expect(ids).toContain('pfx-deep');
+    expect(ids).not.toContain('pfx-sibling');
   });
 });

@@ -245,16 +245,36 @@ export interface EntityQuery {
   limit?: number;
 }
 
+/**
+ * Boundary-aware scope-prefix matching, shared by every prefix query.
+ *
+ * A bare `LIKE 'prefix%'` would also match sibling scopes ('proj:app' would
+ * match 'proj:app2/...'). This predicate matches the exact scope or any
+ * '/'-rooted descendant, and stays sargable: '/' (0x2F) and '0' (0x30) are
+ * adjacent code points, so the range [prefix + '/', prefix + '0') covers
+ * exactly the descendants and keeps idx_entities_scope usable.
+ */
+function pushPrefixClause(
+  column: string,
+  prefixes: readonly string[],
+  clauses: string[],
+  params: SqlValue[],
+): void {
+  const parts: string[] = [];
+  for (const prefix of prefixes) {
+    parts.push(`(${column} = ? OR (${column} >= ? || '/' AND ${column} < ? || '0'))`);
+    params.push(prefix, prefix, prefix);
+  }
+  if (parts.length > 0) clauses.push(`(${parts.join(' OR ')})`);
+}
+
 export function findEntitiesByScope(
   db: SynapseDatabase,
   { scopePrefixes = [], types = [], limit = 100 }: EntityQuery = {},
 ): EntityRow[] {
   const clauses: string[] = [];
   const params: SqlValue[] = [];
-  if (scopePrefixes.length > 0) {
-    clauses.push(`(${scopePrefixes.map(() => 'scope_path LIKE ?').join(' OR ')})`);
-    for (const prefix of scopePrefixes) params.push(`${prefix}%`);
-  }
+  pushPrefixClause('scope_path', scopePrefixes, clauses, params);
   if (types.length > 0) {
     clauses.push(`type IN (${types.map(() => '?').join(', ')})`);
     for (const type of types) params.push(type);
@@ -278,20 +298,15 @@ export function deleteStaleIndexedEntities(
   types: readonly string[],
   keepIds: ReadonlySet<string>,
 ): number {
-  // Boundary-aware prefix match: exact scope, or a descendant below a '/'
-  // segment separator. A bare LIKE '${scopePrefix}%' would also match sibling
+  // Shares the boundary-aware prefix predicate with findEntitiesByScope /
+  // getVectors: a bare LIKE '${scopePrefix}%' would also match sibling
   // scopes like 'proj:app2/...' and delete entities outside the indexed tree.
-  // Sargable range form (BINARY collation): '/' (0x2F) and '0' (0x30) are
-  // adjacent code points, so [prefix + '/', prefix + '0') covers exactly the
-  // '/'-rooted descendants and keeps idx_entities_scope usable.
+  const clauses: string[] = [`type IN (${types.map(() => '?').join(', ')})`, `json_extract(metadata, '$.synapse_indexed') = 1`];
+  const params: SqlValue[] = [...types];
+  pushPrefixClause('scope_path', [scopePrefix], clauses, params);
   const rows = db
-    .prepare(
-      `SELECT id FROM entities
-       WHERE (scope_path = ? OR (scope_path >= ? || '/' AND scope_path < ? || '0'))
-         AND type IN (${types.map(() => '?').join(', ')})
-         AND json_extract(metadata, '$.synapse_indexed') = 1`,
-    )
-    .all(scopePrefix, scopePrefix, scopePrefix, ...types);
+    .prepare(`SELECT id FROM entities WHERE ${clauses.join(' AND ')}`)
+    .all(...params);
   const stale = rows
     .map((row) => reqStr(row, 'id'))
     .filter((id) => !keepIds.has(id));
@@ -304,7 +319,6 @@ export function deleteStaleIndexedEntities(
 // ---------------------------------------------------------------------------
 // Lexical search (FTS5 / BM25)
 // ---------------------------------------------------------------------------
-
 /**
  * Escape a free-text query into a safe FTS5 MATCH expression: lowercase,
  * split into alphanumeric tokens, each double-quoted (AND semantics).
@@ -363,10 +377,7 @@ export function getVectors(db: SynapseDatabase, options: VectorQuery = {}): Vect
   const { scopePrefixes = [], types = [], limit = 1000 } = options;
   const clauses: string[] = [];
   const params: SqlValue[] = [];
-  if (scopePrefixes.length > 0) {
-    clauses.push(`(${scopePrefixes.map(() => 'e.scope_path LIKE ?').join(' OR ')})`);
-    for (const prefix of scopePrefixes) params.push(`${prefix}%`);
-  }
+  pushPrefixClause('e.scope_path', scopePrefixes, clauses, params);
   if (types.length > 0) {
     clauses.push(`e.type IN (${types.map(() => '?').join(', ')})`);
     for (const type of types) params.push(type);

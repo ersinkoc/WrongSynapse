@@ -137,14 +137,17 @@ describe('hybridSearch', () => {
     expect(out.warnings).toEqual([]); // a skipped mismatch is silent degradation
   });
 
-  it('skips vector candidates whose scope only shares a LIKE prefix', async () => {
-    // getVectors filters by SQL LIKE 'prefix%', which matches proj:demo2;
-    // the segment-aware matchesFilters re-check must reject it.
-    insertEntity(db, { id: 'like', type: 'file', scopePath: 'proj:demo2/file:like.ts', name: 'like.ts', content: 'validate tokens' });
+  it('re-checks vector candidates whose scope over-matches the SQL prefix', async () => {
+    // getVectors' SQL range form matches any 'prefix/...' string, including
+    // NESTED dir values: stored scope proj:demo/dir:src/deep/file:like.ts
+    // starts with 'proj:demo/dir:src/'. The segment-aware matchesFilters
+    // parses the dir value as a single segment ('src/deep' != 'src') and
+    // must reject it — the in-memory re-check is the correctness backstop.
+    insertEntity(db, { id: 'like', type: 'file', scopePath: 'proj:demo/dir:src/deep/file:like.ts', name: 'like.ts', content: 'validate tokens' });
     upsertVector(db, 'like', await embedder.embed('validate tokens'));
     const out = await hybridSearch(db, embedder, {
       query: 'validate tokens',
-      scopes: ['proj:demo'],
+      scopes: ['proj:demo/dir:src'],
       lexicalWeight: 0,
       vectorWeight: 1,
       graphWeight: 0,
