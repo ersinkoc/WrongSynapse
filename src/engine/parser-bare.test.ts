@@ -3,10 +3,11 @@
  * null` arm (fileScope/dirChain/containment parents), project-name detection
  * fallback, and the call-graph edge cases that manifest-less fixtures expose:
  * unknown callees, top-level calls (no enclosing symbol), self-recursion, and
- * duplicate call edges.
+ * duplicate call edges. A symlink entry (neither file nor directory) is
+ * skipped by the walker; a nested directory exercises the dirChain IIFE arm.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -44,6 +45,12 @@ beforeAll(async () => {
       'topLevel();', // call with no enclosing symbol -> no caller
     ].join('\n'),
   );
+  // A nested directory: dirChain must walk multiple segments with pkg === null.
+  mkdirSync(join(dir, 'src', 'nested'), { recursive: true });
+  writeFileSync(join(dir, 'src', 'nested', 'deep.ts'), 'export function deepFn() {}\n');
+  // A symlink: Dirent reports isSymbolicLink() (not isFile/isDirectory), so
+  // the walker must skip it rather than index it as a file.
+  symlinkSync(join(dir, 'root.ts'), join(dir, 'root-link.ts'), 'file');
 });
 
 afterAll(() => {
@@ -55,15 +62,19 @@ describe('indexWorkspace without a root manifest', () => {
   it('falls back to the directory name and scopes files under proj only', async () => {
     const result = await indexWorkspace(db, embedder, { workspacePath: dir });
     expect(result.projectName).toBe(basename(dir));
-    expect(result.filesScanned).toBe(2);
+    // root.ts, src/calls.ts, src/nested/deep.ts — the symlink is NOT a file.
+    expect(result.filesScanned).toBe(3);
 
-    const root = findEntitiesByScope(db, { scopePrefixes: [`proj:${basename(dir)}`], types: ['file'] });
-    const names = root.map((f) => f.name).sort();
-    expect(names).toEqual(['calls.ts', 'root.ts']);
+    const files = findEntitiesByScope(db, { scopePrefixes: [`proj:${basename(dir)}`], types: ['file'] });
+    const names = files.map((f) => f.name).sort();
+    expect(names).toEqual(['calls.ts', 'deep.ts', 'root.ts']);
     // No pkg segment in any scope: the bare workspace has no package.json.
-    for (const file of root) {
+    for (const file of files) {
       expect(file.scopePath).not.toContain('/pkg:');
     }
+    // The symlink was skipped entirely.
+    const links = findEntitiesByScope(db, { scopePrefixes: [`proj:${basename(dir)}`] });
+    expect(links.some((e) => e.name === 'root-link.ts')).toBe(false);
   });
 
   it('extracts symbols, links resolvable calls, and dedupes repeated edges', async () => {

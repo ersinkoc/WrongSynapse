@@ -188,7 +188,7 @@ describe('CLI main()', () => {
   it('closes the database after a one-shot index', async () => {
     const close = vi.fn();
     mocks.openDatabase.mockResolvedValueOnce({
-      backend: 'better-sqlite3', path: ':memory:', exec: () => {}, prepare: () => {},
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
       transaction: <T>(fn: () => T): T => fn(), close,
     });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -376,8 +376,8 @@ describe('entry-point auto-run branch (module re-import)', () => {
     forceEntryArgv();
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
     mocks.openDatabase.mockResolvedValueOnce({
-      backend: 'better-sqlite3', path: ':memory:', exec: () => {}, prepare: () => {},
-      transaction: <T>(fn: () => T): T => fn(), close: () => { throw new Error('already closed'); },
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
+      transaction: <T>(fn: () => T): T => fn(), close: vi.fn(() => { throw new Error('already closed'); }),
     });
     try {
       vi.resetModules();

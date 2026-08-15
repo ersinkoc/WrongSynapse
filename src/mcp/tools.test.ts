@@ -150,6 +150,37 @@ describe('synapse_hybrid_query', () => {
       expect(Number.isFinite(r.score)).toBe(true);
     }
   });
+
+  it('truncates null and oversized entity content in results', async () => {
+    insertEntity(db, {
+      id: 'null-content-file',
+      type: 'file',
+      scopePath: 'proj:demo/file:nullc.ts',
+      name: 'nullc.ts',
+      content: null,
+    });
+    insertEntity(db, {
+      id: 'long-content-file',
+      type: 'file',
+      scopePath: 'proj:demo/file:longc.ts',
+      name: 'longc.ts',
+      content: 'y'.repeat(600),
+    });
+
+    const out = await tool('synapse_hybrid_query').handler(ctx, { query: 'nullc', limit: 10 });
+    const parsed = JSON.parse(out.content[0]!.text) as {
+      results: { entity_id: string; content: string | null }[];
+    };
+    const byId = new Map(parsed.results.map((r) => [r.entity_id, r.content] as const));
+    // content null -> truncate(null) returns null (the `text === null` arm).
+    expect(byId.get('null-content-file')).toBeNull();
+
+    const long = await tool('synapse_hybrid_query').handler(ctx, { query: 'longc', limit: 10 });
+    const longParsed = JSON.parse(long.content[0]!.text) as { results: { entity_id: string; content: string | null }[] };
+    const longById = new Map(longParsed.results.map((r) => [r.entity_id, r.content] as const));
+    // 600 chars -> truncated to 500 + ellipsis (the `length > max` arm).
+    expect(longById.get('long-content-file')).toBe('y'.repeat(500) + '…');
+  });
 });
 
 describe('synapse_anchor_memory arg edge cases', () => {
@@ -245,6 +276,23 @@ describe('synapse_index_workspace', () => {
 
   it('requires a workspace_path argument', async () => {
     await expect(tool('synapse_index_workspace').handler(ctx, {})).rejects.toThrow();
+  });
+
+  it('treats a non-record options argument as empty', async () => {
+    // The shared `workspace` fixture is removed at the end of the first test,
+    // so this test creates its own.
+    const own = mkdtempSync(join(tmpdir(), 'synapse-tool-opt-'));
+    writeFileSync(join(own, 'package.json'), JSON.stringify({ name: 'tool-opt' }));
+    writeFileSync(join(own, 'a.ts'), 'export function fb() { return 2; }\n');
+    const out = await tool('synapse_index_workspace').handler(ctx, {
+      workspace_path: own,
+      options: 'not-an-object',
+    });
+    // `isRecord('not-an-object')` is false -> options default to {} -> AST
+    // parsing is on (default), proving the non-record arm was taken.
+    const parsed = JSON.parse(out.content[0]!.text) as { filesParsed: number };
+    expect(parsed.filesParsed).toBeGreaterThan(0);
+    rmSync(own, { recursive: true, force: true });
   });
 });
 

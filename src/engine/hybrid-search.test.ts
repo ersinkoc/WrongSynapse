@@ -137,6 +137,36 @@ describe('hybridSearch', () => {
     expect(out.warnings).toEqual([]); // a skipped mismatch is silent degradation
   });
 
+  it('skips vector candidates whose scope only shares a LIKE prefix', async () => {
+    // getVectors filters by SQL LIKE 'prefix%', which matches proj:demo2;
+    // the segment-aware matchesFilters re-check must reject it.
+    insertEntity(db, { id: 'like', type: 'file', scopePath: 'proj:demo2/file:like.ts', name: 'like.ts', content: 'validate tokens' });
+    upsertVector(db, 'like', await embedder.embed('validate tokens'));
+    const out = await hybridSearch(db, embedder, {
+      query: 'validate tokens',
+      scopes: ['proj:demo'],
+      lexicalWeight: 0,
+      vectorWeight: 1,
+      graphWeight: 0,
+      limit: 10,
+    });
+    expect(out.results.every((r) => r.entity.id !== 'like')).toBe(true);
+  });
+
+  it('skips graph expansion entirely when graphWeight is zero', async () => {
+    const out = await hybridSearch(db, embedder, {
+      query: 'authorization',
+      lexicalWeight: 1,
+      vectorWeight: 0,
+      graphWeight: 0,
+      limit: 10,
+    });
+    // 'authorization' only matches file a; its CONTAINS neighbor sym is
+    // reachable only through graph expansion, which is disabled here.
+    expect(out.results.some((r) => r.entity.id === 'sym')).toBe(false);
+    expect(out.results.some((r) => r.entity.id === 'a')).toBe(true);
+  });
+
   it('reports matched scopes for multi-prefix queries', async () => {
     const out = await hybridSearch(db, embedder, {
       query: 'validate tokens',

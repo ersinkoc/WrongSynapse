@@ -13,6 +13,7 @@ import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
 import { findEntitiesByScope, getNeighbors } from '../db/queries.js';
 import { FakeEmbedder, FailingEmbedder } from '../../test/helpers/fake-embedder.js';
+import type { Embedder } from './embedding.js';
 import { indexWorkspace } from './parser.js';
 
 let db: SynapseDatabase;
@@ -46,6 +47,14 @@ beforeAll(async () => {
   writeFileSync(join(gitDir, 'src.ts'), 'export const fromGit = 1;\n');
   git(['add', '.'], gitDir);
   git(['commit', '-q', '-m', 'feat: initial'], gitDir);
+  // Second commit touches a file the walker skips (gitignored): its diff
+  // entry has no indexed entity, so the `!seen.has(fileId)` guard continues.
+  // `git add -f` is required: a plain `git add .` would honour .gitignore and
+  // silently omit ignored.ts from the commit.
+  writeFileSync(join(gitDir, '.gitignore'), 'ignored.ts\n');
+  writeFileSync(join(gitDir, 'ignored.ts'), 'export const skipped = 1;\n');
+  git(['add', '-f', '.gitignore', 'ignored.ts'], gitDir);
+  git(['commit', '-q', '-m', 'chore: ignored'], gitDir);
 
   // An initialized repo with NO commits: git.log fails -> warning path.
   emptyGitDir = mkdtempSync(join(tmpdir(), 'synapse-idx-nocommit-'));
@@ -90,6 +99,31 @@ describe('indexWorkspace error paths', () => {
     expect(result.embeddingsStored).toBe(0);
     expect(result.warnings.some((w) => w.includes('embeddings skipped'))).toBe(true);
   });
+
+  it('stores only the vectors an embedder actually returns (short batch)', async () => {
+    // An embedder may legally return fewer rows than requested; the indexer
+    // must store what it produced and silently skip the rest.
+    const shortBatch: Embedder = {
+      modelId: 'short-batch',
+      dimension: 16,
+      isReady: () => true,
+      init: async () => {},
+      embed: async () => new Float32Array(16),
+      embedBatch: async (texts: readonly string[]) => {
+        // Return one fewer vector than requested so the last task has no
+        // vector and the `vector === undefined` guard must skip it.
+        return texts.slice(0, Math.max(0, texts.length - 1)).map(() => new Float32Array(16));
+      },
+    };
+    const result = await indexWorkspace(db, shortBatch, { workspacePath: fixtureDir });
+    // The short-batch embedder returns exactly one fewer vector than the
+    // number of embed tasks (files-with-content + symbols). Exactly that one
+    // missing vector must be skipped — proving the `vector === undefined`
+    // guard, not just that "something was stored".
+    const embedTasks = result.filesScanned + result.symbolsIndexed;
+    expect(result.embeddingsStored).toBe(embedTasks - 1);
+    expect(result.filesScanned).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe('indexWorkspace with git history', () => {
@@ -102,12 +136,15 @@ describe('indexWorkspace with git history', () => {
     expect(commits[0]!.metadata?.['hash']).toBeTruthy();
 
     // The indexed file should be linked to the commit that introduced it.
+    // (The fixture has two commits; only the initial one touched src.ts.)
     const file = findEntitiesByScope(db, { scopePrefixes: ['proj:fixture-git'], types: ['file'] }).find(
       (e) => e.name === 'src.ts',
     );
     expect(file).toBeDefined();
     const edges = getNeighbors(db, file!.id, { direction: 'out', relationFilter: ['INTRODUCED_BY_COMMIT'] });
     expect(edges.length).toBeGreaterThanOrEqual(1);
-    expect(edges[0]!.entityId).toBe(commits[0]!.id);
+    const initialCommit = commits.find((c) => c.content === 'feat: initial');
+    expect(initialCommit).toBeDefined();
+    expect(edges.some((e) => e.entityId === initialCommit!.id)).toBe(true);
   });
 });

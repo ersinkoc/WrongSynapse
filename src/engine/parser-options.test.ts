@@ -7,9 +7,9 @@
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
@@ -21,6 +21,7 @@ let db: SynapseDatabase;
 const embedder = new FakeEmbedder();
 let dir: string;
 let monorepo: string;
+let emptyNameDir: string;
 
 beforeAll(async () => {
   db = await openDatabase(':memory:');
@@ -48,12 +49,19 @@ beforeAll(async () => {
   mkdirSync(join(monorepo, 'packages', 'anon'));
   writeFileSync(join(monorepo, 'packages', 'anon', 'package.json'), JSON.stringify({ version: '1.0.0' }));
   writeFileSync(join(monorepo, 'packages', 'anon', 'n.ts'), 'export const n = 1;\n');
+
+  // Root manifest with an EMPTY name: detectProjectName must fall back to the
+  // directory name (`typeof name === 'string' && name !== ''` false arm).
+  emptyNameDir = mkdtempSync(join(tmpdir(), 'synapse-emptyname-'));
+  writeFileSync(join(emptyNameDir, 'package.json'), JSON.stringify({ name: '' }));
+  writeFileSync(join(emptyNameDir, 'e.ts'), 'export const e = 1;\n');
 });
 
 afterAll(() => {
   db.close();
   rmSync(dir, { recursive: true, force: true });
   rmSync(monorepo, { recursive: true, force: true });
+  rmSync(emptyNameDir, { recursive: true, force: true });
 });
 
 describe('indexWorkspace option arms', () => {
@@ -84,15 +92,19 @@ describe('indexWorkspace option arms', () => {
     expect(findEntitiesByScope(db, { scopePrefixes: [`proj:malformed`] }, ).length).toBeGreaterThanOrEqual(1);
   });
 
-  it('treats a nameless manifest as a package named by its directory', async () => {
-    await indexWorkspace(db, embedder, { workspacePath: monorepo });
-    const packages = findEntitiesByScope(db, { scopePrefixes: ['proj:mono-root'], types: ['package'] }).map(
-      (p) => p.name,
-    );
-    expect(packages).toContain('@mono/core');
-    expect(packages).toContain('anon');
-    // Files inside a nested package scope use the package's name.
-    const m = findEntitiesByScope(db, { scopePrefixes: ['proj:mono-root/pkg:@mono/core'], types: ['file'] });
-    expect(m.map((f) => f.name)).toContain('m.ts');
+  it('falls back to the directory name for an empty manifest name', async () => {
+    const result = await indexWorkspace(db, embedder, { workspacePath: emptyNameDir });
+    expect(result.projectName).toBe(basename(emptyNameDir));
+    // Entities are scoped under the directory-derived project name.
+    const files = findEntitiesByScope(db, { scopePrefixes: [result.projectScope], types: ['file'] });
+    expect(files.map((f) => f.name)).toContain('e.ts');
+  });
+
+  it('skips the embedding pass when no content produces embed tasks', async () => {
+    // maxFileBytes: 0 makes every file oversized -> content '' -> no embed
+    // tasks, so the `embedTasks.length > 0` false arm is exercised.
+    const result = await indexWorkspace(db, embedder, { workspacePath: dir, maxFileBytes: 0 });
+    expect(result.embeddingsStored).toBe(0);
+    expect(result.warnings.some((w) => w.includes('embeddings'))).toBe(false);
   });
 });

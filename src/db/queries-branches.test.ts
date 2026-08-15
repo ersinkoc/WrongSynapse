@@ -7,7 +7,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type { SynapseDatabase } from './connection.js';
+import type { SqlValue, SynapseDatabase } from './connection.js';
 import {
   escapeFtsQuery,
   getEntity,
@@ -26,8 +26,8 @@ function fakeDb(row: unknown = undefined, rows: unknown[] = []): SynapseDatabase
     close: () => {},
     transaction: <T>(fn: () => T): T => fn(),
     prepare: () => ({
-      get: vi.fn(() => row),
-      all: vi.fn(() => rows),
+      get: vi.fn((..._params: SqlValue[]) => row as Record<string, unknown> | undefined),
+      all: vi.fn((..._params: SqlValue[]) => rows as Record<string, unknown>[]),
       run: vi.fn(() => ({ changes: 0, lastInsertRowid: 0 })),
     }),
   };
