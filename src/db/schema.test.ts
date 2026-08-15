@@ -25,6 +25,18 @@ afterAll(() => {
   db.close();
 });
 
+describe('assertFts5 failure branch', () => {
+  it('throws a descriptive error when the SQLite build lacks FTS5', () => {
+    const broken = {
+      exec: () => {
+        throw new Error('no such module: fts5');
+      },
+    } as unknown as SynapseDatabase;
+    expect(() => assertFts5(broken)).toThrow(/lacks FTS5 support/);
+  });
+});
+
+
 describe('migrations', () => {
   it('advances user_version and creates the FTS table', () => {
     const row = db.prepare('PRAGMA user_version').get();

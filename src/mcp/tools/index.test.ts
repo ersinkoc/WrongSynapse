@@ -100,4 +100,42 @@ describe('registerTools', () => {
     await calls[0]!.cb({ q: 1 });
     expect(seen[0]).toEqual({ q: 1 });
   });
+
+  it('wraps non-Error throws as a string payload (errorText branch)', async () => {
+    const defs: readonly ToolDefinition[] = [
+      {
+        name: 'str_thrower',
+        description: 'S',
+        inputSchema: {} as never,
+        handler: async () => {
+          throw 'plain string failure'; // eslint-disable-line no-throw-literal
+        },
+      },
+    ];
+    const { registerTool, calls } = fakeServer();
+    registerTools({ registerTool } as never, ctx, defs);
+    const result = await calls[0]!.cb({});
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0]!.text)).toEqual({ error: 'plain string failure' });
+  });
+
+  it('substitutes an empty object for null args', async () => {
+    const seen: unknown[] = [];
+    const defs: readonly ToolDefinition[] = [
+      {
+        name: 'nullargs',
+        description: 'N',
+        inputSchema: {} as never,
+        handler: async (_c, args) => {
+          seen.push(args);
+          return textResult('ok');
+        },
+      },
+    ];
+    const { registerTool, calls } = fakeServer();
+    registerTools({ registerTool } as never, ctx, defs);
+    const result = await calls[0]!.cb(null);
+    expect(result.isError).toBe(false);
+    expect(seen[0]).toEqual({});
+  });
 });

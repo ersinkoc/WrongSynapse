@@ -68,8 +68,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     args: argv,
     options: {
       transport: { type: 'string', default: 'stdio' },
-      port: { type: 'string', default: '8765' },
-      db: { type: 'string', default: process.env['SYNAPSE_DB_PATH'] ?? './synapse.db' },
+      port: { type: 'string' },
+      db: { type: 'string' },
       index: { type: 'string' },
       'model-dir': { type: 'string' },
       'allow-remote-model': { type: 'boolean', default: false },
@@ -90,7 +90,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     return;
   }
 
-  const db = await openDatabase(cli.db ?? './synapse.db');
+  // Flag > env > default resolution keeps every arm observable (parseArgs
+  // defaults would collapse the env fallback into an untestable constant).
+  const db = await openDatabase(cli.db ?? process.env['SYNAPSE_DB_PATH'] ?? './synapse.db');
   activeDb = db;
   migrate(db);
   assertFts5(db);
@@ -114,8 +116,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   }
 
   if (cli.transport === 'sse') {
-    const port = Number(cli.port ?? '8765');
-    if (!Number.isFinite(port) || port <= 0) throw new Error(`invalid --port '${cli.port}'`);
+    const portRaw = cli.port ?? process.env['SYNAPSE_PORT'] ?? '8765';
+    const port = Number(portRaw);
+    if (!Number.isFinite(port) || port <= 0) {
+      throw new Error(`invalid port '${portRaw}' (from ${cli.port !== undefined ? '--port' : 'SYNAPSE_PORT'})`);
+    }
     const handle = await runSse(ctx, port);
     console.error(`WrongSynapse SSE server listening on http://localhost:${port}/sse`);
     await new Promise<void>((resolvePromise) => {
@@ -174,6 +179,8 @@ export function isMainEntryPoint(
 
 const isEntryPoint = isMainEntryPoint(import.meta.url, process.argv[1], (import.meta as { main?: boolean }).main);
 
+// Covered in-process by the entry-point lifecycle tests in src/index.test.ts
+// (vi.resetModules + a controlled process.argv re-import).
 if (isEntryPoint) {
   // Graceful Ctrl+C / SIGTERM: close the live DB (if any) then exit. These are
   // installed ONLY in the entry-point branch so library imports of main() never

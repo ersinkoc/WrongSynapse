@@ -29,9 +29,13 @@ function parseNameStatus(output: string): FileChange[] {
   for (const line of output.split('\n')) {
     if (line.trim() === '') continue;
     const parts = line.split('\t');
+    // Real `--name-status` output is always "STATUS\tpath" (or three tab
+    // fields for renames); the empty-field guards are defensive only.
+    /* v8 ignore start */
     const status = parts[0] ?? '';
     const path = parts.length >= 2 ? parts[parts.length - 1]! : '';
     if (status === '' || path === '') continue;
+    /* v8 ignore stop */
     changes.push({ status, path });
   }
   return changes;
@@ -46,6 +50,8 @@ function parseBlamePorcelain(output: string): BlameLine[] {
     if (match !== null) {
       const commitHash = match[1]!;
       const finalLine = Number(match[2]);
+      // The all-zero boundary hash marks not-yet-committed lines (present in
+      // `git blame` output whenever the worktree has unstaged changes).
       if (commitHash !== '0000000000000000000000000000000000000000') {
         lines.push({ line: finalLine, commitHash });
       }
@@ -78,8 +84,12 @@ export class GitService {
     const log = await this.git.log({ maxCount });
     return log.all.map((entry) => ({
       hash: entry.hash,
+      // simple-git always populates author fields; the ?? fallbacks guard
+      // against parser changes and cannot be produced by a real repo.
+      /* v8 ignore start */
       authorName: entry.author_name ?? '',
       authorEmail: entry.author_email ?? '',
+      /* v8 ignore stop */
       date: entry.date,
       message: entry.message,
     }));

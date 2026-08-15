@@ -131,6 +131,23 @@ describe('TransformersEmbedder lifecycle', () => {
     expect(embedder.isReady()).toBe(false);
   });
 
+  it('stringifies non-Error pipeline failures', async () => {
+    pipelineMock.mockRejectedValue('raw string failure');
+    const embedder = createEmbedder();
+    await expect(embedder.init()).rejects.toThrow(/raw string failure/);
+  });
+
+  it('shares one in-flight init promise between concurrent callers', async () => {
+    installPipeline('vector');
+    const embedder = createEmbedder();
+    // Second init() arrives while the first is still pending: it must reuse
+    // initPromise, not spawn a second pipeline load.
+    const first = embedder.init();
+    const second = embedder.init();
+    await Promise.all([first, second]);
+    expect(pipelineMock).toHaveBeenCalledTimes(1);
+  });
+
   it('allows a retry after a failed load', async () => {
     pipelineMock.mockRejectedValueOnce(new Error('first fail'));
     const embedder = createEmbedder();
@@ -150,5 +167,35 @@ describe('TransformersEmbedder lifecycle', () => {
 describe('getSharedEmbedder', () => {
   it('returns the same singleton instance', () => {
     expect(getSharedEmbedder()).toBe(getSharedEmbedder());
+  });
+});
+
+describe('tensor data coercion (non-Float32Array pipeline outputs)', () => {
+  /** A pipeline output whose `.data` is not a Float32Array (some ONNX backends
+   * hand back plain or nested arrays); tensorData must flatten it. */
+  function rawTensor(data: unknown, dims: number[]): object {
+    return { data, dims };
+  }
+
+  it('flattens a plain number array', async () => {
+    pipelineMock.mockResolvedValue(async () => rawTensor([1, 0, 0, 0], [4]));
+    const vec = await createEmbedder().embed('hello');
+    expect(vec.length).toBe(4);
+    expect(vec[0]).toBeCloseTo(1, 6);
+  });
+
+  it('flattens nested number arrays', async () => {
+    pipelineMock.mockResolvedValue(async () => rawTensor([[1, 0], [0, 0]], [4]));
+    const vec = await createEmbedder().embed('hello');
+    expect(vec.length).toBe(4);
+    expect(vec[0]).toBeCloseTo(1, 6);
+  });
+
+  it('coerces a tensor with no numeric data to an empty vector', async () => {
+    pipelineMock.mockResolvedValue(async () => rawTensor(['a', 'b'], [4]));
+    const vec = await createEmbedder().embed('hello');
+    // flattenNumbers drops non-numbers entirely: nothing survives, so the
+    // vector is empty (documented degradation, not a crash).
+    expect(vec.length).toBe(0);
   });
 });

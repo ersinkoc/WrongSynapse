@@ -219,6 +219,71 @@ describe('runSse (end-to-end over HTTP)', () => {
       await handle.close();
     }
   });
+
+  it('returns 400 for a POST without any sessionId parameter', async () => {
+    const handle = await runSse(ctx, 0);
+    const port = (handle.server.address() as AddressInfo).port;
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          { host: '127.0.0.1', port, path: '/messages', method: 'POST', headers: { 'content-type': 'application/json' } },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on('error', reject);
+        req.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }));
+        req.end();
+      });
+      expect(status).toBe(400);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('returns 500 when the SDK transport rejects a second connection', async () => {
+    const handle = await runSse(ctx, 0);
+    const port = (handle.server.address() as AddressInfo).port;
+    try {
+      // 1. Establish one live SSE session and wait for its endpoint event —
+      //    this proves mcpServer.connect() has completed.
+      const firstStream = http.get({ host: '127.0.0.1', port, path: '/sse' });
+      const endpoint = await new Promise<string>((resolve, reject) => {
+        firstStream.on('response', (res) => {
+          if (res.statusCode !== 200) {
+            reject(new Error('first GET /sse returned ' + res.statusCode));
+            return;
+          }
+          let buf = '';
+          res.on('data', (chunk) => {
+            buf += chunk.toString();
+            const match = /data: (\/messages\?sessionId=[^\n]+)/.exec(buf);
+            if (match !== null) {
+              res.removeAllListeners('data');
+              resolve(match[1]!);
+            }
+          });
+        });
+        firstStream.on('error', reject);
+      });
+
+      // 2. A second SSE connection reuses the SAME McpServer, whose
+      //    connect() throws "Already connected" — handled as HTTP 500.
+      const secondStatus = await new Promise<number>((resolve, reject) => {
+        http
+          .get({ host: '127.0.0.1', port, path: '/sse' }, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          })
+          .on('error', reject);
+      });
+      expect(endpoint.startsWith('/messages?sessionId=')).toBe(true);
+      expect(secondStatus).toBe(500);
+    } finally {
+      await handle.close();
+    }
+  });
 });
 
 describe('runStdio', () => {

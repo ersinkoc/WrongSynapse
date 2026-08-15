@@ -1,9 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
-import { findEntitiesByScope, getCandidate, getNeighbors, insertEntity, insertRelation } from '../db/queries.js';
-import { FakeEmbedder } from '../../test/helpers/fake-embedder.js';
+import { findEntitiesByScope, getCandidate, getEntity, getNeighbors, insertEntity, insertRelation } from '../db/queries.js';
+import { FakeEmbedder, FailingEmbedder } from '../../test/helpers/fake-embedder.js';
 import { TOOL_DEFINITIONS } from './tools/definitions.js';
 import type { ToolContext, ToolDefinition } from './tools/index.js';
 
@@ -207,5 +210,68 @@ describe('synapse_record_observation / promote arg edge cases', () => {
     await expect(
       tool('synapse_promote_candidate').handler(ctx, { candidate_id: candidateId, target_scope: 'proj:demo/file:x.ts' }),
     ).rejects.toThrow(/already promoted/);
+  });
+});
+
+describe('synapse_index_workspace', () => {
+  let workspace: string;
+
+  it('passes recognized options through to the indexer', async () => {
+    workspace = mkdtempSync(join(tmpdir(), 'synapse-tool-idx-'));
+    writeFileSync(join(workspace, 'package.json'), JSON.stringify({ name: 'tool-idx' }));
+    mkdirSync(join(workspace, 'src'));
+    writeFileSync(join(workspace, 'src', 'a.ts'), 'export function fa() { return 1; }\n');
+
+    const out = await tool('synapse_index_workspace').handler(ctx, {
+      workspace_path: workspace,
+      options: { parse_ast: false, include_git_history: true, depth: 2 },
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { filesScanned: number; filesParsed: number; commitsIndexed: number };
+    // Two files in the fixture: package.json + src/a.ts (directories are not files).
+    expect(parsed.filesScanned).toBe(2);
+    // parse_ast: false -> no AST symbol extraction
+    expect(parsed.filesParsed).toBe(0);
+
+    // Unrecognized option keys leave every switch at its default (AST on).
+    const again = await tool('synapse_index_workspace').handler(ctx, {
+      workspace_path: workspace,
+      options: { bogus_key: 'ignored' },
+    });
+    const parsedAgain = JSON.parse(again.content[0]!.text) as { filesParsed: number };
+    expect(parsedAgain.filesParsed).toBeGreaterThan(0);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it('requires a workspace_path argument', async () => {
+    await expect(tool('synapse_index_workspace').handler(ctx, {})).rejects.toThrow();
+  });
+});
+
+describe('embedding-unavailable degradation (anchored memories)', () => {
+  // Built inside each test: `db` is only assigned in beforeAll.
+  const failCtx = (): ToolContext => ({ db, embedder: new FailingEmbedder() });
+
+  it('anchors a memory without an embedding and reports embedded=false', async () => {
+    const out = await tool('synapse_anchor_memory').handler(failCtx(), {
+      content: 'stored without a model',
+      target_scope: 'proj:demo/file:auth.ts',
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { entity_id: string; embedded: boolean };
+    expect(parsed.entity_id).toBeTruthy();
+    expect(parsed.embedded).toBe(false);
+    expect(getEntity(db, parsed.entity_id)).toBeDefined();
+  });
+
+  it('promotes a candidate without an embedding and reports embedded=false', async () => {
+    const record = await tool('synapse_record_observation').handler(failCtx(), { content: 'promote me modellessly' });
+    const candidateId = (JSON.parse(record.content[0]!.text) as { candidate_id: string }).candidate_id;
+    const out = await tool('synapse_promote_candidate').handler(failCtx(), {
+      candidate_id: candidateId,
+      target_scope: 'proj:demo/file:auth.ts',
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { entity_id: string; embedded: boolean };
+    expect(parsed.embedded).toBe(false);
+    expect(getCandidate(db, candidateId)?.status).toBe('promoted');
   });
 });

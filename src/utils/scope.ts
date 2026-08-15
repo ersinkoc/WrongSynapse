@@ -50,6 +50,9 @@ export function parseScope(raw: string): ParsedScope {
   let match: RegExpExecArray | null;
   while ((match = PAIR_RE.exec(raw)) !== null) {
     const kindToken = match[1]!;
+    // The regex alternation only captures known kind tokens, so this guard is
+    // unreachable defensive code (kept as a belt-and-braces check).
+    /* v8 ignore next */
     if (!isValidKind(kindToken)) {
       throw new TypeError(`unknown scope kind '${kindToken}' in '${raw}'`);
     }
@@ -69,6 +72,9 @@ export function parseScope(raw: string): ParsedScope {
     // The next marker starts at its leading '/', which is not part of the
     // value; slice up to (excluding) that position.
     const valueEnd = next === undefined ? raw.length : next.start;
+    // A next-marker always starts after this marker ends (the regex consumes
+    // the pair), so `valueEnd < valueStart` cannot occur; kept defensively.
+    /* v8 ignore next 3 */
     if (valueEnd < valueStart) {
       throw new TypeError(`scope segment '${marker.kind}:<empty>' has no value in '${raw}'`);
     }

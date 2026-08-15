@@ -4,9 +4,9 @@
  * a process. Heavy dependencies are mocked.
  */
 
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { ToolContext } from './mcp/tools/index.js';
 
@@ -96,6 +96,7 @@ describe('isMainEntryPoint', () => {
 describe('CLI main()', () => {
   afterEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('prints help for --help without opening a database', async () => {
@@ -143,6 +144,267 @@ describe('CLI main()', () => {
   });
 
   it('rejects an invalid SSE port', async () => {
-    await expect(main(['--transport', 'sse', '--port', 'abc'])).rejects.toThrow();
+    await expect(main(['--transport', 'sse', '--port', 'abc'])).rejects.toThrow(/invalid port 'abc'/);
+  });
+
+  it('resolves --db from SYNAPSE_DB_PATH when the flag is absent', async () => {
+    vi.stubEnv('SYNAPSE_DB_PATH', '/env/default.db');
+    await main(['--index', '/tmp/ws']);
+    expect(mocks.openDatabase).toHaveBeenCalledWith('/env/default.db');
+  });
+
+  it('resolves the SSE port from SYNAPSE_PORT when the flag is absent', async () => {
+    vi.stubEnv('SYNAPSE_PORT', '9123');
+    await main(['--transport', 'sse']);
+    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 9123);
+  });
+
+  it('names SYNAPSE_PORT as the source when the env port is invalid', async () => {
+    vi.stubEnv('SYNAPSE_PORT', 'not-a-number');
+    await expect(main(['--transport', 'sse'])).rejects.toThrow(/SYNAPSE_PORT/);
+  });
+
+  it('uses the default port when neither flag nor env is set', async () => {
+    await main(['--transport', 'sse']);
+    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 8765);
+  });
+
+  it('treats an empty --model-dir as absent', async () => {
+    await main(['--index', '/tmp/ws', '--model-dir', '']);
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith(undefined);
+  });
+
+  it('passes model-dir and remote-model options to the embedder', async () => {
+    await main(['--index', '/tmp/ws', '--model-dir', '/m', '--allow-remote-model']);
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({ localModelDir: '/m', allowRemoteModels: true });
+  });
+
+  it('allows the remote model via env alone', async () => {
+    vi.stubEnv('SYNAPSE_ALLOW_REMOTE_MODEL', '1');
+    await main(['--index', '/tmp/ws']);
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({ localModelDir: undefined, allowRemoteModels: true });
+  });
+
+  it('closes the database after a one-shot index', async () => {
+    const close = vi.fn();
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: () => {}, prepare: () => {},
+      transaction: <T>(fn: () => T): T => fn(), close,
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await main(['--index', '/tmp/ws']);
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
+describe('entry-point auto-run branch (module re-import)', () => {
+  // Snapshot the FULL argv: the re-imported entry branch calls main() with its
+  // default argv = process.argv.slice(2), so the vitest runner's own CLI flags
+  // (e.g. --coverage, which CI passes) would reach strict parseArgs and abort
+  // the worker via the real process.exit(1). Controlling argv[1] alone is not
+  // enough; the tail must be empty whenever entry is forced.
+  let realArgv: string[];
+  const entryPath = fileURLToPath(import.meta.url).replace(/index\.test\.ts$/, 'index.ts');
+  let onSpy: ReturnType<typeof vi.spyOn>;
+  let sigintHandler: ((...args: unknown[]) => void) | undefined;
+  let sigtermHandler: ((...args: unknown[]) => void) | undefined;
+
+  beforeAll(() => {
+    realArgv = [...process.argv];
+    // Capture signal registrations instead of attaching real listeners to the
+    // test-runner process (prevents MaxListeners growth across re-imports).
+    onSpy = vi
+      .spyOn(process, 'on')
+      .mockImplementation(
+        ((event: string, cb: (...a: unknown[]) => void) => {
+          if (event === 'SIGINT') sigintHandler = cb;
+          if (event === 'SIGTERM') sigtermHandler = cb;
+          return process;
+        }) as never,
+      );
+  });
+
+  afterAll(() => {
+    onSpy.mockRestore();
+  });
+
+  /** Restore the runner's argv and clear captured handlers. */
+  function reset(): void {
+    process.argv = [...realArgv];
+    sigintHandler = undefined;
+    sigtermHandler = undefined;
+  }
+
+  /** Force the entry branch: argv[1] = this module, empty flag tail. */
+  function forceEntryArgv(): void {
+    process.argv = [process.argv[0]!, entryPath];
+  }
+
+  /** One macrotask yield: flushes every pending microtask (deterministic). */
+  function tick(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  afterEach(() => {
+    reset();
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it('runs main() automatically when argv[1] resolves to this module', async () => {
+    // Precondition: if realpath matching ever breaks on this platform, the
+    // entry branch would silently never fire and every test here would pass
+    // by skipping the code under test — fail loudly instead. Compare the
+    // ENTRY module's URL form (what index.ts sees as its own import.meta.url)
+    // against the argv path we are about to install.
+    expect(isMainEntryPoint(pathToFileURL(entryPath).href, entryPath, undefined)).toBe(true);
+    forceEntryArgv();
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(mocks.runStdio).toHaveBeenCalledTimes(1), { timeout: 1000 });
+    } finally {
+      reset();
+    }
+  });
+
+  it('does not run main() when argv[1] is a different program', async () => {
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      // main() is invoked synchronously in the entry branch, so if it were
+      // going to run, its first await (openDatabase) would have been scheduled
+      // already — one macrotask flush settles that deterministically.
+      await tick();
+      expect(mocks.runStdio).not.toHaveBeenCalled();
+    } finally {
+      reset();
+    }
+  });
+
+  it('reports and exits(1) when the auto-run main() rejects', async () => {
+    forceEntryArgv();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    mocks.runStdio.mockRejectedValueOnce(new Error('boot failure'));
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(error).toHaveBeenCalledWith('boot failure'), { timeout: 1000 });
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+      reset();
+    }
+  });
+
+  /** Shared signal-shutdown assertions with explicit preconditions. */
+  async function expectSignalShutdown(): Promise<void> {
+    forceEntryArgv();
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(mocks.runStdio).toHaveBeenCalledTimes(1), { timeout: 1000 });
+      // Preconditions: if these fail, the entry-point branch never re-ran and
+      // the order assertion below would compare undefined — fail with cause.
+      const handler = sigintHandler;
+      expect(handler, 'SIGINT handler must be registered').toBeDefined();
+
+      const firstResult = mocks.openDatabase.mock.results[0];
+      expect(firstResult, 'main() must have opened the database').toBeDefined();
+      const dbHandle = (await firstResult!.value) as { close: ReturnType<typeof vi.fn> };
+      handler!();
+      expect(dbHandle.close).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(0);
+      const closeOrder = dbHandle.close.mock.invocationCallOrder[0];
+      const exitOrder = exit.mock.invocationCallOrder[0];
+      expect(closeOrder, 'shutdown() must have closed the DB').toBeDefined();
+      expect(exitOrder, 'shutdown() must have exited').toBeDefined();
+      // The DB must close BEFORE the process exits (graceful shutdown order).
+      expect(closeOrder!).toBeLessThan(exitOrder!);
+    } finally {
+      exit.mockRestore();
+      reset();
+    }
+  }
+
+  it('closes the live DB and exits(0) when SIGINT fires (shutdown lifecycle)', async () => {
+    await expectSignalShutdown();
+  });
+
+  it('registers both SIGINT and SIGTERM handlers at entry', async () => {
+    forceEntryArgv();
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(mocks.runStdio).toHaveBeenCalledTimes(1), { timeout: 1000 });
+      // Both signals route to the same shutdown(); assert registration rather
+      // than re-invoking the identical code path.
+      expect(onSpy).toHaveBeenCalledWith('SIGINT', expect.any(Function));
+      expect(onSpy).toHaveBeenCalledWith('SIGTERM', expect.any(Function));
+      expect(sigintHandler).toBe(sigtermHandler);
+    } finally {
+      reset();
+    }
+  });
+
+  it('tolerates a signal before main() populates activeDb (null arm)', async () => {
+    forceEntryArgv();
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    // Park main() at its first await forever: activeDb stays deterministically
+    // null and no orphan continuation can resolve after the simulated exit.
+    mocks.openDatabase.mockReturnValueOnce(new Promise(() => {}));
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      expect(sigintHandler).toBeDefined();
+      sigintHandler!();
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      exit.mockRestore();
+      reset();
+    }
+  });
+
+  it('exits cleanly even when db.close() throws (catch arm)', async () => {
+    forceEntryArgv();
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: () => {}, prepare: () => {},
+      transaction: <T>(fn: () => T): T => fn(), close: () => { throw new Error('already closed'); },
+    });
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(mocks.runStdio).toHaveBeenCalledTimes(1), { timeout: 1000 });
+      sigintHandler!();
+      expect(exit).toHaveBeenCalledWith(0); // best-effort close, still exits
+    } finally {
+      exit.mockRestore();
+      reset();
+    }
+  });
+
+  it('stringifies non-Error rejections from auto-run main() (catch ternary arm)', async () => {
+    forceEntryArgv();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    mocks.runStdio.mockRejectedValueOnce('plain string boot failure');
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(error).toHaveBeenCalledWith('plain string boot failure'), { timeout: 1000 });
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+      reset();
+    }
   });
 });

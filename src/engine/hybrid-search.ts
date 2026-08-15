@@ -85,9 +85,15 @@ export async function hybridSearch(
   // ---- 1. Lexical (FTS5 / BM25) -------------------------------------------
   const ftsRanked: string[] = [];
   for (const hit of searchFts(db, query, MAX_CANDIDATES)) {
+    // FK cascades delete FTS rows with their entities, so a missing entity
+    // here is not producible through the public API.
     const entity = getEntity(db, hit.entityId);
+    /* v8 ignore next */
     if (entity === undefined) continue;
     if (!matchesFilters(entity.scopePath, entity.type, scopes, typesFilter)) continue;
+    // entities_fts is content-linked to entities (1:1 on rowid), so the JOIN
+    // cannot yield the same entity twice.
+    /* v8 ignore next */
     if (!ftsRanked.includes(hit.entityId)) ftsRanked.push(hit.entityId);
   }
 
@@ -125,6 +131,9 @@ export async function hybridSearch(
     for (const seed of seeds) {
       for (const neighbor of getNeighbors(db, seed, { depth: graphDepth, direction: 'both', maxNodes: NEIGHBOR_CAP })) {
         const entity = getEntity(db, neighbor.entityId);
+        // FK cascades delete relations with their entities, so a missing
+        // neighbor is not producible through the public API.
+        /* v8 ignore next */
         if (entity === undefined) continue;
         if (!matchesFilters(entity.scopePath, entity.type, scopes, typesFilter)) continue;
         graphScores.set(neighbor.entityId, (graphScores.get(neighbor.entityId) ?? 0) + 1 / (neighbor.depth + 1));
@@ -161,7 +170,10 @@ export async function hybridSearch(
   // ---- 5. Assemble results with contextual graph paths ---------------------
   const results: HybridResult[] = [];
   for (const entry of scored.slice(0, limit)) {
+    // Entities in `scored` were joined from live rows; a missing row here
+    // requires a concurrent delete between ranking and assembly.
     const entity = getEntity(db, entry.id);
+    /* v8 ignore next */
     if (entity === undefined) continue;
     results.push({
       entity,

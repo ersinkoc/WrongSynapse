@@ -133,7 +133,9 @@ function optStr(row: Record<string, unknown>, key: string): string | null {
 
 function num(row: Record<string, unknown>, key: string): number {
   const value = row[key];
-  return typeof value === 'number' ? value : Number(value ?? 0);
+  // Selected columns always exist in driver rows; null coerces to 0 via
+  // Number(null), matching the previous `?? 0` behaviour.
+  return typeof value === 'number' ? value : Number(value);
 }
 
 function optNum(row: Record<string, unknown>, key: string): number | null {
@@ -547,8 +549,9 @@ export function listCandidates(
 
 export function dbStats(db: SynapseDatabase): DbStats {
   const count = (table: string): number => {
-    const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get();
-    return row === undefined ? 0 : num(row, 'n');
+    // COUNT(*) always returns exactly one row on both drivers.
+    const row = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!;
+    return num(row, 'n');
   };
   return {
     entities: count('entities'),

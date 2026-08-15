@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
 import { findEntitiesByScope, getNeighbors } from '../db/queries.js';
-import { FakeEmbedder } from '../../test/helpers/fake-embedder.js';
+import { FakeEmbedder, FailingEmbedder } from '../../test/helpers/fake-embedder.js';
 import { indexWorkspace } from './parser.js';
 
 let db: SynapseDatabase;
@@ -81,6 +81,14 @@ describe('indexWorkspace error paths', () => {
     const result = await indexWorkspace(db, embedder, { workspacePath: emptyGitDir, includeGitHistory: true });
     expect(result.warnings.some((w) => w.includes('git'))).toBe(true);
     expect(result.commitsIndexed).toBe(0);
+  });
+
+  it('skips embeddings with a warning when the model is unavailable', async () => {
+    const result = await indexWorkspace(db, new FailingEmbedder(), { workspacePath: fixtureDir });
+    // Structural indexing succeeded; only the semantic layer degraded.
+    expect(result.filesScanned).toBeGreaterThanOrEqual(2);
+    expect(result.embeddingsStored).toBe(0);
+    expect(result.warnings.some((w) => w.includes('embeddings skipped'))).toBe(true);
   });
 });
 

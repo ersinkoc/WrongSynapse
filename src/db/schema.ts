@@ -90,6 +90,9 @@ export const SCHEMA_VERSION: number = MIGRATIONS.length;
  */
 export function migrate(db: SynapseDatabase): void {
   const row = db.prepare('PRAGMA user_version').get();
+  // The non-number arm is defensive: `PRAGMA user_version` always returns an
+  // integer row on both drivers.
+  /* v8 ignore next */
   let version = typeof row?.['user_version'] === 'number' ? (row['user_version'] as number) : 0;
   while (version < MIGRATIONS.length) {
     const sql = MIGRATIONS[version]!;

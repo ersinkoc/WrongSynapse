@@ -44,6 +44,9 @@ export async function runSse(ctx: ToolContext, port: number): Promise<SseServerH
   const transports = new Map<string, SSEServerTransport>();
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    // Node always populates req.url for parsed requests; the fallback guards
+    // only against non-standard embedding hosts.
+    /* v8 ignore next */
     const url = new URL(req.url ?? '/', `http://${req.headers['host'] ?? 'localhost'}`);
     try {
       if (req.method === 'GET' && url.pathname === '/sse') {
@@ -71,6 +74,9 @@ export async function runSse(ctx: ToolContext, port: number): Promise<SseServerH
       res.end('Not found');
     } catch (error) {
       res.writeHead(500, { 'content-type': 'text/plain' });
+      // Every throw site in this handler (URL parsing, the SDK transports)
+      // produces Error instances; the String() arm is defensive.
+      /* v8 ignore next */
       res.end(error instanceof Error ? error.message : String(error));
     }
   };

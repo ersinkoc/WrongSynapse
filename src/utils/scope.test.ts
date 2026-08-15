@@ -125,6 +125,22 @@ describe('getFileSegment / getSymbolSegment', () => {
   });
 });
 
+describe('parseScope malformed values', () => {
+  it('rejects a trailing slash in a segment value', () => {
+    expect(() => parseScope('proj:a/dir:/')).toThrow(TypeError);
+  });
+});
+
+describe('scopeMatchesPrefix argument forms', () => {
+  it('accepts ParsedScope objects for both target and prefix', () => {
+    const target = parseScope('proj:a/file:src/auth.ts');
+    const prefix = parseScope('proj:a/file:src');
+    expect(scopeMatchesPrefix(target, prefix)).toBe(true);
+    // A ParsedScope prefix longer than the target must not throw.
+    expect(scopeMatchesPrefix(target, parseScope('proj:a/file:src/auth.ts/sym:fn'))).toBe(false);
+  });
+});
+
 describe('parentScope', () => {
   it('strips the trailing segment', () => {
     expect(parentScope('proj:app/file:auth.ts/sym:validate')).toBe('proj:app/file:auth.ts');

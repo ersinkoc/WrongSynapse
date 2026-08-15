@@ -4,6 +4,7 @@ import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
 import { insertEntity, insertRelation, upsertVector } from '../db/queries.js';
 import { FakeEmbedder, FailingEmbedder } from '../../test/helpers/fake-embedder.js';
+import type { Embedder } from './embedding.js';
 import { hybridSearch } from './hybrid-search.js';
 
 let db: SynapseDatabase;
@@ -100,6 +101,40 @@ describe('hybridSearch', () => {
     expect(out.vectorRetrievalUsed).toBe(false);
     expect(out.warnings.length).toBeGreaterThan(0);
     expect(out.results.length).toBeGreaterThan(0); // lexical path still works
+  });
+
+  it('stringifies non-Error throwables from the embedder in warnings', async () => {
+    // A pipeline that throws a plain string (some native bindings do) must be
+    // reported by message, not crash the whole query.
+    const stringThrower: Embedder = {
+      modelId: 'string-thrower',
+      dimension: 16,
+      isReady: () => false,
+      init: async () => {},
+      embed: async () => {
+        throw 'raw string failure';
+      },
+      embedBatch: async () => {
+        throw 'raw string failure';
+      },
+    };
+    const out = await hybridSearch(db, stringThrower, { query: 'token validation', limit: 10 });
+    expect(out.vectorRetrievalUsed).toBe(false);
+    expect(out.warnings.some((w) => w.includes('raw string failure'))).toBe(true);
+    expect(out.results.length).toBeGreaterThan(0);
+  });
+
+  it('skips stored vectors whose dimension does not match the query embedding', async () => {
+    // A stale/corrupt 3-dim vector must be skipped by the cosine pass — the
+    // entity may still surface via FTS, but its vector rank stays null.
+    insertEntity(db, { id: 'odd', type: 'file', scopePath: 'proj:demo/dir:src/file:odd.ts', name: 'odd.ts', content: 'token validation' });
+    upsertVector(db, 'odd', new Float32Array([1, 0, 0])); // 3 dims vs FakeEmbedder's 16
+    const out = await hybridSearch(db, embedder, { query: 'token validation', limit: 10 });
+    const odd = out.results.find((r) => r.entity.id === 'odd');
+    expect(odd).toBeDefined(); // lexical path still finds it
+    expect(odd!.ranks.vector).toBeNull(); // dimension mismatch: skipped by cosine
+    expect(out.vectorRetrievalUsed).toBe(true); // well-formed vectors still ranked
+    expect(out.warnings).toEqual([]); // a skipped mismatch is silent degradation
   });
 
   it('reports matched scopes for multi-prefix queries', async () => {

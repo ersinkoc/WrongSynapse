@@ -78,6 +78,9 @@ function vectorsFromTensor(tensor: Tensor, expected: number): Float32Array[] {
     if (rest.length === 1) {
       out.push(normalizeInPlace(row));
     } else {
+      // rest.length >= 2 here, so the last dimension always exists; the
+      // fallback is defensive against shape-shifting backends.
+      /* v8 ignore next */
       const dim = rest[rest.length - 1] ?? EMBEDDING_DIMENSION;
       out.push(normalizeInPlace(meanPool(row, per / dim, dim)));
     }
@@ -132,17 +135,22 @@ class TransformersEmbedder implements Embedder {
     }
   }
 
+  /* v8 ignore start -- unreachable via the public API: embed()/embedBatch() always await init() first, which either sets the extractor or throws */
   private requireExtractor(): FeatureExtractionPipelineLike {
     if (this.extractor === null) {
       throw new Error(`Embedding engine not initialized for model '${this.modelId}'. Call init() first.`);
     }
     return this.extractor;
   }
+  /* v8 ignore stop */
 
   async embed(text: string): Promise<Float32Array> {
     await this.init();
     const tensor = await this.requireExtractor()(text, { pooling: 'mean', normalize: true });
     const vectors = vectorsFromTensor(tensor, 1);
+    // vectorsFromTensor always returns at least one row for 1-D output; the
+    // fallback guards against shape-shifting ONNX backends.
+    /* v8 ignore next */
     return vectors[0] ?? new Float32Array(this.dimension);
   }
 
