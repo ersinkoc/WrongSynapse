@@ -8,6 +8,8 @@
  *  - synapse_graph_neighbors     relational sub-graph traversal
  *  - synapse_record_observation  write an episodic memory candidate
  *  - synapse_promote_candidate   promote a candidate into a permanent memory
+ *  - synapse_list_candidates     list the candidate pool by status
+ *  - synapse_discard_candidate   discard a pending candidate (terminal)
  */
 
 import { randomUUID } from 'node:crypto';
@@ -23,6 +25,7 @@ import {
   insertCandidate,
   insertEntity,
   insertRelation,
+  listCandidates,
   setCandidateStatus,
   upsertVector,
 } from '../../db/queries.js';
@@ -132,6 +135,8 @@ const hybridQueryTool: ToolDefinition = {
     limit: z.number().describe('Maximum results (default 10).').optional(),
     vector_weight: z.number().describe('Semantic weight in RRF (default 1).').optional(),
     lexical_weight: z.number().describe('Lexical (BM25) weight in RRF (default 1).').optional(),
+    graph_weight: z.number().describe('Graph-expansion weight in RRF (default 1).').optional(),
+    graph_depth: z.number().describe('Graph traversal depth for expansion, 1..3 (default 1).').optional(),
   }),
   handler: async (ctx, args) => {
     const query = requireString(args, 'query');
@@ -140,6 +145,8 @@ const hybridQueryTool: ToolDefinition = {
     const limit = intArg(args['limit'], 10, 1, 50);
     const vectorWeight = numberArg(args['vector_weight'], 1, 0, 10);
     const lexicalWeight = numberArg(args['lexical_weight'], 1, 0, 10);
+    const graphWeight = numberArg(args['graph_weight'], 1, 0, 10);
+    const graphDepth = intArg(args['graph_depth'], 1, 1, 3);
     const output = await hybridSearch(ctx.db, ctx.embedder, {
       query,
       scopes,
@@ -147,6 +154,8 @@ const hybridQueryTool: ToolDefinition = {
       limit,
       vectorWeight,
       lexicalWeight,
+      graphWeight,
+      graphDepth,
     });
     const compact = output.results.map((result) => ({
       entity_id: result.entity.id,
@@ -228,7 +237,7 @@ const graphNeighborsTool: ToolDefinition = {
     'Return the relational sub-graph around an entity: what calls it, what it calls, which commit changed it, ' +
     'which memory rules apply to it, and its parent hierarchy.',
   inputSchema: z.object({
-    entity_id: z.string().describe('Entity id (or scope path).'),
+    entity_id: z.string().describe('Entity id or its exact scope path (e.g. "proj:app/file:src/auth.ts").'),
     depth: z.number().describe('Traversal depth (default 1, max 5).').optional(),
     direction: z.enum(['in', 'out', 'both']).describe('Edge direction (default both).').optional(),
     relation_filter: z
@@ -241,11 +250,21 @@ const graphNeighborsTool: ToolDefinition = {
     const depth = intArg(args['depth'], 1, 1, 5);
     const direction = args['direction'] === 'in' || args['direction'] === 'out' ? args['direction'] : 'both';
     const relationFilter = stringArray(args['relation_filter']);
-    const entity = getEntity(ctx.db, entityId);
+    // The schema promises "entity id or its exact scope path": ids first,
+    // then a typed scope lookup (structural entities win over memory entries
+    // anchored at the same scope — getEntityByScope breaks ties on
+    // updated_at DESC, which favors recently-written memories), then an
+    // untyped fallback for non-structural types.
+    const entity =
+      getEntity(ctx.db, entityId) ??
+      getEntityByScope(ctx.db, entityId, STRUCTURAL_TARGET_TYPES) ??
+      getEntityByScope(ctx.db, entityId);
     if (entity === undefined) {
       throw new Error(`entity '${entityId}' not found`);
     }
-    const neighbors = getNeighbors(ctx.db, entityId, { depth, direction, relationFilter });
+    // Traverse by the RESOLVED id: when the caller passed a scope path, the
+    // raw input is a URI, not a primary key.
+    const neighbors = getNeighbors(ctx.db, entity.id, { depth, direction, relationFilter });
     const neighborRows = neighbors.map((neighbor) => {
       // Relations are FK-bound to entities (cascade delete), so the neighbor
       // row always resolves; the lookup and its null fallbacks are defensive.
@@ -261,7 +280,7 @@ const graphNeighborsTool: ToolDefinition = {
         depth: neighbor.depth,
       };
     });
-    const paths = getGraphPath(ctx.db, entityId, { relationFilter, limit: 20 });
+    const paths = getGraphPath(ctx.db, entity.id, { relationFilter, limit: 20 });
     return jsonResult({
       entity: { id: entity.id, name: entity.name, type: entity.type, scope_path: entity.scopePath },
       neighbors: neighborRows,
@@ -315,6 +334,9 @@ const promoteCandidateTool: ToolDefinition = {
     if (candidate.status === 'promoted') {
       throw new Error(`candidate '${candidateId}' is already promoted`);
     }
+    if (candidate.status === 'discarded') {
+      throw new Error(`candidate '${candidateId}' is discarded and cannot be promoted`);
+    }
     const id = randomUUID();
     insertEntity(ctx.db, {
       id,
@@ -347,6 +369,62 @@ const promoteCandidateTool: ToolDefinition = {
   },
 };
 
+const listCandidatesTool: ToolDefinition = {
+  name: 'synapse_list_candidates',
+  description:
+    'List memory candidates from the episodic pool, optionally filtered by status, newest first. ' +
+    'Use this to review pending observations before promoting or discarding them.',
+  inputSchema: z.object({
+    status: z.enum(['pending', 'promoted', 'discarded']).describe('Filter by lifecycle status.').optional(),
+    limit: z.number().describe('Maximum candidates to return (default 20, max 100).').optional(),
+  }),
+  handler: async (ctx, args) => {
+    const status =
+      args['status'] === 'pending' || args['status'] === 'promoted' || args['status'] === 'discarded'
+        ? args['status']
+        : undefined;
+    const limit = intArg(args['limit'], 20, 1, 100);
+    const candidates = listCandidates(ctx.db, { status, limit });
+    return jsonResult({
+      candidates: candidates.map((candidate) => ({
+        id: candidate.id,
+        content: truncate(candidate.content, 500),
+        scope_path: candidate.scopePath,
+        extracted_from: candidate.extractedFrom,
+        confidence: candidate.confidence,
+        status: candidate.status,
+        created_at: candidate.createdAt,
+      })),
+      count: candidates.length,
+    });
+  },
+};
+
+const discardCandidateTool: ToolDefinition = {
+  name: 'synapse_discard_candidate',
+  description:
+    'Discard a pending memory candidate (marks it discarded; it stays queryable by status but is no longer promotable). ' +
+    'Completes the candidate lifecycle alongside synapse_promote_candidate.',
+  inputSchema: z.object({
+    candidate_id: z.string().describe('Candidate id returned by synapse_record_observation.'),
+  }),
+  handler: async (ctx, args) => {
+    const candidateId = requireString(args, 'candidate_id');
+    const candidate = getCandidate(ctx.db, candidateId);
+    if (candidate === undefined) {
+      throw new Error(`candidate '${candidateId}' not found`);
+    }
+    if (candidate.status === 'promoted') {
+      throw new Error(`candidate '${candidateId}' is already promoted`);
+    }
+    if (candidate.status === 'discarded') {
+      throw new Error(`candidate '${candidateId}' is already discarded`);
+    }
+    setCandidateStatus(ctx.db, candidateId, 'discarded');
+    return jsonResult({ candidate_id: candidateId, status: 'discarded' });
+  },
+};
+
 export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   indexWorkspaceTool,
   hybridQueryTool,
@@ -354,4 +432,6 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   graphNeighborsTool,
   recordObservationTool,
   promoteCandidateTool,
+  listCandidatesTool,
+  discardCandidateTool,
 ];

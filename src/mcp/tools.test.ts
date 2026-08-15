@@ -32,7 +32,7 @@ afterAll(() => {
 });
 
 describe('MCP tool definitions', () => {
-  it('exposes all six tools', () => {
+  it('exposes all eight tools', () => {
     expect(TOOL_DEFINITIONS.map((t) => t.name)).toEqual([
       'synapse_index_workspace',
       'synapse_hybrid_query',
@@ -40,6 +40,8 @@ describe('MCP tool definitions', () => {
       'synapse_graph_neighbors',
       'synapse_record_observation',
       'synapse_promote_candidate',
+      'synapse_list_candidates',
+      'synapse_discard_candidate',
     ]);
   });
 });
@@ -206,6 +208,49 @@ describe('synapse_graph_neighbors arg edge cases', () => {
     );
   });
 
+  it('resolves an entity by scope path when the id is not found', async () => {
+    // Own fixture: this test must not depend on insertion order of other tests.
+    insertEntity(db, { id: 'scope-file', type: 'file', scopePath: 'proj:demo/file:scope.ts', name: 'scope.ts', content: 'x' });
+    insertEntity(db, { id: 'scope-sym', type: 'symbol', scopePath: 'proj:demo/file:scope.ts/sym:helper', name: 'helper', content: 'helper' });
+    insertRelation(db, { sourceId: 'scope-file', targetId: 'scope-sym', relation: 'CONTAINS' });
+
+    // The schema promises "entity id (or scope path)": a caller holding only
+    // the URI must reach the same entity AND see its graph (traversal must use
+    // the resolved id, not the raw URI input).
+    const out = await tool('synapse_graph_neighbors').handler(ctx, { entity_id: 'proj:demo/file:scope.ts' });
+    const parsed = JSON.parse(out.content[0]!.text) as { entity: { id: string; name: string }; neighbors: { entity_id: string }[] };
+    expect(parsed.entity.id).toBe('scope-file');
+    expect(parsed.entity.name).toBe('scope.ts');
+    expect(parsed.neighbors.some((n) => n.entity_id === 'scope-sym')).toBe(true);
+  });
+
+  it('passes graph_weight and graph_depth through to the retriever', async () => {
+    const out = await tool('synapse_hybrid_query').handler(ctx, {
+      query: 'auth note',
+      graph_weight: 5,
+      graph_depth: 2,
+      limit: 5,
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { results: { score: number }[]; warnings: string[] };
+    expect(Array.isArray(parsed.results)).toBe(true);
+    for (const r of parsed.results) expect(Number.isFinite(r.score)).toBe(true);
+  });
+
+  it('clamps out-of-range graph_weight and rounds fractional graph_depth without corrupting fusion', async () => {
+    // Mirrors the vector_weight/limit clamp convention: out-of-range inputs
+    // must not throw and must keep every fused score finite. graph_depth is
+    // an intArg, so 2.7 rounds (rather than rejecting) — surfaced here.
+    const out = await tool('synapse_hybrid_query').handler(ctx, {
+      query: 'auth note',
+      graph_weight: 99, // clamps to [0, 10]
+      graph_depth: 2.7, // rounds to 3
+      limit: 5,
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { results: { score: number }[] };
+    expect(Array.isArray(parsed.results)).toBe(true);
+    for (const r of parsed.results) expect(Number.isFinite(r.score)).toBe(true);
+  });
+
   it('honors direction and depth arguments', async () => {
     insertEntity(db, { id: 'dir-file', type: 'file', scopePath: 'proj:demo/file:dir.ts', name: 'dir.ts', content: 'x' });
     insertEntity(db, { id: 'dir-sym', type: 'symbol', scopePath: 'proj:demo/file:dir.ts/sym:fn', name: 'fn', content: 'fn' });
@@ -241,6 +286,56 @@ describe('synapse_record_observation / promote arg edge cases', () => {
     await expect(
       tool('synapse_promote_candidate').handler(ctx, { candidate_id: candidateId, target_scope: 'proj:demo/file:x.ts' }),
     ).rejects.toThrow(/already promoted/);
+  });
+
+  it('lists candidates filtered by status and honors the limit clamp', async () => {
+    for (let i = 0; i < 3; i++) {
+      await tool('synapse_record_observation').handler(ctx, { content: `bulk observation ${i}` });
+    }
+    const all = await tool('synapse_list_candidates').handler(ctx, { status: 'pending', limit: 2 });
+    const allOut = JSON.parse(all.content[0]!.text) as { candidates: unknown[]; count: number };
+    expect(allOut.count).toBe(2); // limit honored
+
+    const clamped = await tool('synapse_list_candidates').handler(ctx, { limit: 500 });
+    const clampedOut = JSON.parse(clamped.content[0]!.text) as { count: number };
+    expect(clampedOut.count).toBeLessThanOrEqual(100); // clamped to 100
+  });
+
+  it('discards a pending candidate and blocks re-discard', async () => {
+    const record = await tool('synapse_record_observation').handler(ctx, { content: 'discard me please' });
+    const candidateId = (JSON.parse(record.content[0]!.text) as { candidate_id: string }).candidate_id;
+
+    const discard = await tool('synapse_discard_candidate').handler(ctx, { candidate_id: candidateId });
+    expect(JSON.parse(discard.content[0]!.text)).toEqual({ candidate_id: candidateId, status: 'discarded' });
+    expect(getCandidate(db, candidateId)?.status).toBe('discarded');
+
+    await expect(tool('synapse_discard_candidate').handler(ctx, { candidate_id: candidateId })).rejects.toThrow(
+      /already discarded/,
+    );
+  });
+
+  it('rejects discarding an unknown candidate', async () => {
+    await expect(tool('synapse_discard_candidate').handler(ctx, { candidate_id: 'ghost' })).rejects.toThrow(/not found/);
+  });
+
+  it('rejects discarding an already-promoted candidate', async () => {
+    const record = await tool('synapse_record_observation').handler(ctx, { content: 'promote then discard' });
+    const candidateId = (JSON.parse(record.content[0]!.text) as { candidate_id: string }).candidate_id;
+    await tool('synapse_promote_candidate').handler(ctx, { candidate_id: candidateId, target_scope: 'proj:demo/file:x.ts' });
+    await expect(tool('synapse_discard_candidate').handler(ctx, { candidate_id: candidateId })).rejects.toThrow(
+      /already promoted/,
+    );
+  });
+
+  it('rejects promoting a discarded candidate', async () => {
+    // Discard is terminal: the discard tool's contract says the candidate is
+    // "no longer promotable", and promote must enforce the same.
+    const record = await tool('synapse_record_observation').handler(ctx, { content: 'discard then promote' });
+    const candidateId = (JSON.parse(record.content[0]!.text) as { candidate_id: string }).candidate_id;
+    await tool('synapse_discard_candidate').handler(ctx, { candidate_id: candidateId });
+    await expect(
+      tool('synapse_promote_candidate').handler(ctx, { candidate_id: candidateId, target_scope: 'proj:demo/file:x.ts' }),
+    ).rejects.toThrow(/discarded and cannot be promoted/);
   });
 });
 
