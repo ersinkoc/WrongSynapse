@@ -6,7 +6,6 @@
  * session on GET /sse, JSON-RPC messages via POST /messages?sessionId=...
  */
 
-import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -48,8 +47,8 @@ export async function runSse(ctx: ToolContext, port: number): Promise<SseServerH
     const url = new URL(req.url ?? '/', `http://${req.headers['host'] ?? 'localhost'}`);
     try {
       if (req.method === 'GET' && url.pathname === '/sse') {
-        const sessionId = url.searchParams.get('sessionId') ?? randomUUID();
         const transport = new SSEServerTransport('/messages', res);
+        const sessionId = transport.sessionId;
         transports.set(sessionId, transport);
         res.on('close', () => {
           transports.delete(sessionId);
