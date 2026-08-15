@@ -16,15 +16,17 @@ Everything runs 100% locally on CPU (or local hardware acceleration). No cloud A
 
 ## Features
 
-- **Six MCP tools** over stdio (default) or SSE (`--transport sse`):
+- **Eight MCP tools** over stdio (default) or SSE (`--transport sse`, concurrent sessions supported):
   | Tool | Purpose |
   |---|---|
   | `synapse_index_workspace` | Scan a workspace; parse structure + AST symbols (TS/JS/Py/Go/Rust via tree-sitter); embed; link git commits; persist. |
-  | `synapse_hybrid_query` | Tri-hybrid RRF retrieval with scope/type filters and contextual graph paths. |
+  | `synapse_hybrid_query` | Tri-hybrid RRF retrieval with scope/type filters, weight tuning (`vector`/`lexical`/`graph`), and contextual graph paths. |
   | `synapse_anchor_memory` | Store a decision/note anchored to a symbol, file, package, or project scope (with embedding). |
-  | `synapse_graph_neighbors` | Traverse the relational sub-graph (callers, commits, anchored memories, hierarchy). |
+  | `synapse_graph_neighbors` | Traverse the relational sub-graph (callers, commits, anchored memories, hierarchy); accepts an entity id or exact scope path. |
   | `synapse_record_observation` | Write an uncommitted insight into the episodic memory candidate pool. |
-  | `synapse_promote_candidate` | Promote a candidate into a permanent memory entity with embedding + scope link. |
+  | `synapse_promote_candidate` | Promote a pending candidate into a permanent memory entity with embedding + scope link. |
+  | `synapse_list_candidates` | List the candidate pool, optionally filtered by lifecycle status (pending/promoted/discarded). |
+  | `synapse_discard_candidate` | Discard a pending candidate (terminal — it can no longer be promoted). |
 - **SQLite WAL** with `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, FTS5 auto-sync triggers.
 - **Dual SQLite driver**: `better-sqlite3` primary, automatic `node:sqlite` fallback.
 - **Strict TypeScript, ESM, zero `any`** (target ES2022, `strict` + `noUncheckedIndexedAccess`).
@@ -57,7 +59,7 @@ node dist/index.js --index /path/to/workspace --git
 npm test
 ```
 
-Point any MCP client (Claude Desktop, Cursor, custom agent) at the stdio command to expose the six `synapse_*` tools.
+Point any MCP client (Claude Desktop, Cursor, custom agent) at the stdio command to expose the eight `synapse_*` tools.
 
 ---
 
@@ -79,7 +81,7 @@ src/
 │   └── hybrid-search.ts    # Tri-hybrid retrieval + Reciprocal Rank Fusion (k=60)
 ├── mcp/
 │   ├── server.ts           # McpServer bootstrap: stdio + SSE transports
-│   └── tools/              # 6 MCP tool definitions + registration
+│   └── tools/              # 8 MCP tool definitions + registration
 └── utils/
     └── scope.ts            # Scope URI grammar: parse, build, prefix matching
 ```
@@ -106,6 +108,7 @@ proj:app/commit:9f2a3b1c…                     # git commits
 | `SYNAPSE_MODEL_DIR` | Directory with local model files (offline) | transformers cache |
 | `SYNAPSE_EMBEDDING_MODEL` | Embedding model id | `Xenova/all-MiniLM-L6-v2` |
 | `SYNAPSE_ALLOW_REMOTE_MODEL` | `1` to allow a **one-time** model download from the HF Hub | unset (offline) |
+| `SYNAPSE_PORT` | SSE HTTP port when `--port` is absent | `8765` |
 
 ---
 
