@@ -84,8 +84,7 @@ SQLite entity graph, fully offline.
   migration transactional, with an FTS5 capability probe.
 - **Quality gates** — 215 tests with 100% statement/branch/function/line
   coverage enforced in CI (Node 22 + 24 matrix), typecheck and build gates,
-  `npm audit` (high/critical) gate, and a `prepublishOnly` guard
-  (typecheck + test + build) so a publish can never ship a stale `dist/`.
+  and an `npm audit` (high/critical) gate.
 
 [Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/ersinkoc/WrongSynapse/releases/tag/v0.1.0
