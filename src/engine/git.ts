@@ -87,7 +87,9 @@ export class GitService {
 
   /** Files changed by a commit (including root commits, via diff-tree). */
   async changesForCommit(hash: string): Promise<FileChange[]> {
-    const out = await this.git.raw(['diff-tree', '--no-commit-id', '--name-status', '-r', hash]);
+    // `--root` makes diff-tree show the diff of a root commit (no parent),
+    // which otherwise reports no changes for the very first commit.
+    const out = await this.git.raw(['diff-tree', '--no-commit-id', '--name-status', '-r', '--root', hash]);
     return parseNameStatus(out);
   }
 

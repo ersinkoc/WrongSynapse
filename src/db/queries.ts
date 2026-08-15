@@ -276,14 +276,20 @@ export function deleteStaleIndexedEntities(
   types: readonly string[],
   keepIds: ReadonlySet<string>,
 ): number {
+  // Boundary-aware prefix match: exact scope, or a descendant below a '/'
+  // segment separator. A bare LIKE '${scopePrefix}%' would also match sibling
+  // scopes like 'proj:app2/...' and delete entities outside the indexed tree.
+  // Sargable range form (BINARY collation): '/' (0x2F) and '0' (0x30) are
+  // adjacent code points, so [prefix + '/', prefix + '0') covers exactly the
+  // '/'-rooted descendants and keeps idx_entities_scope usable.
   const rows = db
     .prepare(
       `SELECT id FROM entities
-       WHERE scope_path LIKE ?
+       WHERE (scope_path = ? OR (scope_path >= ? || '/' AND scope_path < ? || '0'))
          AND type IN (${types.map(() => '?').join(', ')})
          AND json_extract(metadata, '$.synapse_indexed') = 1`,
     )
-    .all(`${scopePrefix}%`, ...types);
+    .all(scopePrefix, scopePrefix, scopePrefix, ...types);
   const stale = rows
     .map((row) => reqStr(row, 'id'))
     .filter((id) => !keepIds.has(id));

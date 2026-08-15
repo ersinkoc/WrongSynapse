@@ -11,9 +11,11 @@
  *   wrongsynapse --allow-remote-model     # one-time model download (env: SYNAPSE_ALLOW_REMOTE_MODEL=1)
  */
 
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { openDatabase } from './db/connection.js';
+import { openDatabase, type SynapseDatabase } from './db/connection.js';
 import { assertFts5, migrate } from './db/schema.js';
 import { dbStats } from './db/queries.js';
 import { getSharedEmbedder } from './engine/embedding.js';
@@ -61,8 +63,9 @@ ${TOOL_DEFINITIONS.map((t) => `  ${t.name} — ${t.description.split('.')[0]}.`)
 `);
 }
 
-async function main(): Promise<void> {
+export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
   const { values } = parseArgs({
+    args: argv,
     options: {
       transport: { type: 'string', default: 'stdio' },
       port: { type: 'string', default: '8765' },
@@ -88,6 +91,7 @@ async function main(): Promise<void> {
   }
 
   const db = await openDatabase(cli.db ?? './synapse.db');
+  activeDb = db;
   migrate(db);
   assertFts5(db);
 
@@ -109,17 +113,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  const shutdown = (): void => {
-    try {
-      db.close();
-    } catch {
-      // best-effort close on exit
-    }
-    process.exit(0);
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
   if (cli.transport === 'sse') {
     const port = Number(cli.port ?? '8765');
     if (!Number.isFinite(port) || port <= 0) throw new Error(`invalid --port '${cli.port}'`);
@@ -133,10 +126,65 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+/** The live database for the CLI process (for signal-driven shutdown). */
+let activeDb: SynapseDatabase | null = null;
+
+/** Close the live DB and exit (SIGINT/SIGTERM); installed only in the entry-point branch. */
+function shutdown(): void {
+  try {
+    activeDb?.close();
+  } catch {
+    // best-effort close on exit
+  }
+  process.exit(0);
+}
+
+/**
+ * Decide whether this module was executed as the CLI entry point (vs. imported
+ * as a library). Branch order:
+ *
+ * 1. Real-path comparison of import.meta.url and process.argv[1] — primary.
+ *    Handles npm's `.bin` symlink shims (both sides canonicalized), tsx-style
+ *    loaders, and case-mismatched argv on Windows (paths are case-insensitive
+ *    there but `===` is not).
+ * 2. `import.meta.main` — fallback for launchers whose argv[1] is virtual or
+ *    unresolvable (single-executable bundles, --import wrappers), where the
+ *    realpath comparison throws but the module IS the entry.
+ *
+ * Side-effect-free by design: argv[1] belongs to the importing process, so a
+ * resolution failure must NOT log to stderr (a host importing the library with
+ * a virtual argv[1] would see a false CLI error).
+ */
+export function isMainEntryPoint(
+  importMetaUrl: string,
+  argv1: string | undefined,
+  metaMain: boolean | undefined,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (argv1 !== undefined) {
+    try {
+      const normalize = (p: string): string => (platform === 'win32' ? p.toLowerCase() : p);
+      if (normalize(realpathSync(fileURLToPath(importMetaUrl))) === normalize(realpathSync(argv1))) return true;
+    } catch {
+      // argv[1] unresolvable — fall through to import.meta.main below.
+    }
+  }
+  return metaMain === true;
+}
+
+const isEntryPoint = isMainEntryPoint(import.meta.url, process.argv[1], (import.meta as { main?: boolean }).main);
+
+if (isEntryPoint) {
+  // Graceful Ctrl+C / SIGTERM: close the live DB (if any) then exit. These are
+  // installed ONLY in the entry-point branch so library imports of main() never
+  // register process-level handlers.
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Public library surface (programmatic use)

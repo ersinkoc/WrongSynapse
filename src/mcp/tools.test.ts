@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
-import { findEntitiesByScope, getCandidate, insertEntity } from '../db/queries.js';
+import { findEntitiesByScope, getCandidate, getNeighbors, insertEntity, insertRelation } from '../db/queries.js';
 import { FakeEmbedder } from '../../test/helpers/fake-embedder.js';
 import { TOOL_DEFINITIONS } from './tools/definitions.js';
 import type { ToolContext, ToolDefinition } from './tools/index.js';
@@ -120,5 +120,92 @@ describe('synapse_hybrid_query', () => {
     const parsed = JSON.parse(out.content[0]!.text) as { results: unknown[]; vector_retrieval_used: boolean };
     expect(parsed.vector_retrieval_used).toBe(true);
     expect(Array.isArray(parsed.results)).toBe(true);
+  });
+
+  it('rejects a non-array scopes argument', async () => {
+    await expect(tool('synapse_hybrid_query').handler(ctx, { query: 'x', scopes: 'proj:demo' })).rejects.toThrow(
+      /array/,
+    );
+  });
+
+  it('rejects a non-finite limit', async () => {
+    await expect(tool('synapse_hybrid_query').handler(ctx, { query: 'x', limit: 'ten' })).rejects.toThrow();
+    await expect(tool('synapse_hybrid_query').handler(ctx, { query: 'x', limit: NaN })).rejects.toThrow();
+  });
+
+  it('clamps out-of-range weights and limits', async () => {
+    const out = await tool('synapse_hybrid_query').handler(ctx, { query: 'auth note', limit: 999, vector_weight: 99 });
+    const parsed = JSON.parse(out.content[0]!.text) as { results: { score: number }[] };
+    expect(Array.isArray(parsed.results)).toBe(true);
+    // limit clamps to 50 (not 999): a fixture with 4 entities cannot prove the
+    // cap by counting, so prove the query succeeds and, more importantly, that
+    // the clamped path is exercised by an out-of-range value not throwing.
+    expect(parsed.results.length).toBeLessThanOrEqual(50);
+    // vector_weight clamps to [0,10]: an out-of-range 99 must not corrupt the
+    // RRF fusion — scores stay finite.
+    for (const r of parsed.results) {
+      expect(Number.isFinite(r.score)).toBe(true);
+    }
+  });
+});
+
+describe('synapse_anchor_memory arg edge cases', () => {
+  it('honors a custom relation type and metadata', async () => {
+    insertEntity(db, { id: 'rel-file', type: 'file', scopePath: 'proj:demo/file:rel.ts', name: 'rel.ts', content: 'x' });
+    const out = await tool('synapse_anchor_memory').handler(ctx, {
+      content: 'custom edge note',
+      target_scope: 'proj:demo/file:rel.ts',
+      relation_type: 'SUPERSEDES',
+      metadata: { source: 'test' },
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { entity_id: string; relation: string };
+    expect(parsed.relation).toBe('SUPERSEDES');
+    const neighbors = getNeighbors(db, parsed.entity_id, { direction: 'out' });
+    expect(neighbors.some((n) => n.relation === 'SUPERSEDES' && n.entityId === 'rel-file')).toBe(true);
+  });
+});
+
+describe('synapse_graph_neighbors arg edge cases', () => {
+  it('throws for an unknown entity id', async () => {
+    await expect(tool('synapse_graph_neighbors').handler(ctx, { entity_id: 'does-not-exist' })).rejects.toThrow(
+      /not found/,
+    );
+  });
+
+  it('honors direction and depth arguments', async () => {
+    insertEntity(db, { id: 'dir-file', type: 'file', scopePath: 'proj:demo/file:dir.ts', name: 'dir.ts', content: 'x' });
+    insertEntity(db, { id: 'dir-sym', type: 'symbol', scopePath: 'proj:demo/file:dir.ts/sym:fn', name: 'fn', content: 'fn' });
+    insertRelation(db, { sourceId: 'dir-file', targetId: 'dir-sym', relation: 'CONTAINS' });
+
+    const out = await tool('synapse_graph_neighbors').handler(ctx, {
+      entity_id: 'dir-file',
+      direction: 'out',
+      depth: 1,
+      relation_filter: ['CONTAINS'],
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { neighbors: { entity_id: string; relation: string }[] };
+    expect(parsed.neighbors.some((n) => n.entity_id === 'dir-sym' && n.relation === 'CONTAINS')).toBe(true);
+  });
+});
+
+describe('synapse_record_observation / promote arg edge cases', () => {
+  it('rejects a malformed scope_path', async () => {
+    await expect(tool('synapse_record_observation').handler(ctx, { content: 'x', scope_path: 'garbage' })).rejects.toThrow();
+  });
+
+  it('records with a default confidence when omitted', async () => {
+    const out = await tool('synapse_record_observation').handler(ctx, { content: 'no confidence given' });
+    const parsed = JSON.parse(out.content[0]!.text) as { candidate_id: string };
+    expect(parsed.candidate_id).toBeTruthy();
+    expect(getCandidate(db, parsed.candidate_id)?.confidence).toBeCloseTo(0.7, 6);
+  });
+
+  it('rejects a second promote of the same candidate', async () => {
+    const record = await tool('synapse_record_observation').handler(ctx, { content: 'double promote me' });
+    const candidateId = (JSON.parse(record.content[0]!.text) as { candidate_id: string }).candidate_id;
+    await tool('synapse_promote_candidate').handler(ctx, { candidate_id: candidateId, target_scope: 'proj:demo/file:x.ts' });
+    await expect(
+      tool('synapse_promote_candidate').handler(ctx, { candidate_id: candidateId, target_scope: 'proj:demo/file:x.ts' }),
+    ).rejects.toThrow(/already promoted/);
   });
 });

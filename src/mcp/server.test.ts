@@ -12,16 +12,30 @@
  *    server-generated id — otherwise every POST returns 400 "Unknown session".
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
 import { FakeEmbedder } from '../../test/helpers/fake-embedder.js';
-import { createSynapseServer, runSse, SERVER_NAME, SERVER_VERSION } from './server.js';
+import { createSynapseServer, runSse, runStdio, SERVER_NAME, SERVER_VERSION } from './server.js';
 import { TOOL_DEFINITIONS } from './tools/definitions.js';
 import type { ToolContext } from './tools/index.js';
+
+// Stub the SDK's stdio transport so runStdio() completes in-process instead of
+// blocking on stdin. Only affects the stdio import path; SSE is unaffected.
+vi.mock('@modelcontextprotocol/sdk/server/stdio.js', () => ({
+  StdioServerTransport: class {
+    onmessage: ((msg: unknown) => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: ((err: unknown) => void) | null = null;
+    sessionId = 'test-session';
+    async start(): Promise<void> {}
+    async close(): Promise<void> {}
+    async send(_msg: unknown): Promise<void> {}
+  },
+}));
 
 let db: SynapseDatabase;
 let ctx: ToolContext;
@@ -165,4 +179,51 @@ describe('runSse (end-to-end over HTTP)', () => {
       await handle.close();
     }
   }, 30_000);
+
+  it('returns 404 for unknown routes', async () => {
+    const handle = await runSse(ctx, 0);
+    const port = (handle.server.address() as AddressInfo).port;
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        http
+          .get({ host: '127.0.0.1', port, path: '/nope' }, (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          })
+          .on('error', reject);
+      });
+      expect(status).toBe(404);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('returns 400 for a POST to an unknown session', async () => {
+    const handle = await runSse(ctx, 0);
+    const port = (handle.server.address() as AddressInfo).port;
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          { host: '127.0.0.1', port, path: '/messages?sessionId=bogus', method: 'POST', headers: { 'content-type': 'application/json' } },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on('error', reject);
+        req.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }));
+        req.end();
+      });
+      expect(status).toBe(400);
+    } finally {
+      await handle.close();
+    }
+  });
+});
+
+describe('runStdio', () => {
+  it('connects the stdio transport (stubbed) and returns', async () => {
+    // The SDK stdio module is mocked above, so connect() resolves immediately.
+    await expect(runStdio(ctx)).resolves.toBeUndefined();
+  });
 });

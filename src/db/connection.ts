@@ -36,6 +36,16 @@ const PRAGMAS = [
   'PRAGMA busy_timeout = 5000;',
 ] as const;
 
+/**
+ * Pragma *bodies* for drivers whose API prepends the `PRAGMA` keyword itself
+ * (better-sqlite3's `db.pragma(source)` compiles `PRAGMA ${source}`). Strips
+ * the keyword and trailing semicolon so `pragma('journal_mode = WAL')` stays a
+ * valid statement.
+ */
+const PRAGMA_BODIES: readonly string[] = PRAGMAS.map((statement) =>
+  statement.replace(/^PRAGMA\s+/i, '').replace(/;\s*$/, ''),
+);
+
 /** Normalize a driver row into a plain record (undefined for no row). */
 function toRecord(row: unknown): Record<string, unknown> | undefined {
   if (row === undefined || row === null) return undefined;
@@ -77,7 +87,9 @@ async function createBetterSqlite(dbPath: string): Promise<SynapseDatabase> {
   // load, so the node:sqlite fallback can still be attempted.
   const mod = await import('better-sqlite3');
   const raw = mod.default(dbPath) as unknown as BetterDatabaseLike;
-  for (const pragma of PRAGMAS) raw.pragma(pragma);
+  // better-sqlite3's `pragma()` compiles `PRAGMA ${source}` itself, so the
+  // keyword must NOT be repeated in the source (would yield `PRAGMA PRAGMA …`).
+  for (const pragma of PRAGMA_BODIES) raw.pragma(pragma);
   const wrapStatement = (stmt: BetterStatementLike): SynapseStatement => ({
     run: (...params: SqlValue[]) => stmt.run(...params),
     get: (...params: SqlValue[]) => toRecord(stmt.get(...params)),

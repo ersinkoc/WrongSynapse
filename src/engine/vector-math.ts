@@ -9,8 +9,10 @@ export const EMBEDDING_DIMENSION = 384;
 /** Euclidean (L2) norm of a vector. */
 export function l2Norm(vec: Float32Array): number {
   let sum = 0;
+  // Indices are loop-bounded, so access is always in bounds (asserted under
+  // noUncheckedIndexedAccess instead of branching on a dead `?? 0`).
   for (let i = 0; i < vec.length; i++) {
-    const v = vec[i] ?? 0;
+    const v = vec[i]!;
     sum += v * v;
   }
   return Math.sqrt(sum);
@@ -22,7 +24,7 @@ export function normalizeInPlace(vec: Float32Array): Float32Array {
   if (norm > 0 && norm !== 1) {
     const inv = 1 / norm;
     for (let i = 0; i < vec.length; i++) {
-      vec[i] = (vec[i] ?? 0) * inv;
+      vec[i] = vec[i]! * inv;
     }
   }
   return vec;
@@ -40,8 +42,8 @@ export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   let normA = 0;
   let normB = 0;
   for (let i = 0; i < a.length; i++) {
-    const av = a[i] ?? 0;
-    const bv = b[i] ?? 0;
+    const av = a[i]!;
+    const bv = b[i]!;
     dot += av * bv;
     normA += av * av;
     normB += bv * bv;
@@ -75,12 +77,12 @@ export function meanPool(hidden: Float32Array, seqLen: number, dim: number): Flo
   for (let s = 0; s < seqLen; s++) {
     const offset = s * dim;
     for (let d = 0; d < dim; d++) {
-      out[d] = (out[d] ?? 0) + (hidden[offset + d] ?? 0);
+      out[d] = out[d]! + hidden[offset + d]!;
     }
   }
   const inv = 1 / seqLen;
   for (let d = 0; d < dim; d++) {
-    out[d] = (out[d] ?? 0) * inv;
+    out[d] = out[d]! * inv;
   }
   return out;
 }

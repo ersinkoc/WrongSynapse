@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { buildScope, parseScope, scopeMatchesAnyPrefix, scopeMatchesPrefix, scopeOf } from './scope.js';
+import {
+  buildScope,
+  getFileSegment,
+  getSymbolSegment,
+  parseScope,
+  parentScope,
+  scopeMatchesAnyPrefix,
+  scopeMatchesPrefix,
+  scopeOf,
+} from './scope.js';
 
 describe('parseScope', () => {
   it('parses the canonical spec example', () => {
@@ -86,5 +95,50 @@ describe('scopeMatchesPrefix', () => {
     expect(scopeMatchesAnyPrefix('proj:app/file:a.ts', ['proj:zzz', 'proj:app'])).toBe(true);
     expect(scopeMatchesAnyPrefix('proj:app/file:a.ts', ['proj:zzz'])).toBe(false);
     expect(scopeMatchesAnyPrefix('proj:app/file:a.ts', [])).toBe(true);
+  });
+
+  it('rejects a prefix longer than the target', () => {
+    expect(scopeMatchesPrefix('proj:app', 'proj:app/file:a.ts')).toBe(false);
+  });
+
+  it('rejects mismatched kinds at the same depth', () => {
+    expect(scopeMatchesPrefix('proj:app/file:a.ts', 'proj:app/dir:src')).toBe(false);
+  });
+
+  it('matches file-directory prefixes exactly', () => {
+    expect(scopeMatchesPrefix('proj:app/file:src/auth.ts', 'proj:app/file:src/auth.ts')).toBe(true);
+    expect(scopeMatchesPrefix('proj:app/file:src/auth.ts/sym:x', 'proj:app/file:src')).toBe(true);
+  });
+});
+
+describe('getFileSegment / getSymbolSegment', () => {
+  it('extracts the file and symbol segments when present', () => {
+    const parsed = parseScope('proj:app/file:auth.ts/sym:validateToken');
+    expect(getFileSegment(parsed)?.value).toBe('auth.ts');
+    expect(getSymbolSegment(parsed)?.value).toBe('validateToken');
+  });
+
+  it('returns undefined when the segment kind is absent', () => {
+    const parsed = parseScope('proj:app/pkg:core');
+    expect(getFileSegment(parsed)).toBeUndefined();
+    expect(getSymbolSegment(parsed)).toBeUndefined();
+  });
+});
+
+describe('parentScope', () => {
+  it('strips the trailing segment', () => {
+    expect(parentScope('proj:app/file:auth.ts/sym:validate')).toBe('proj:app/file:auth.ts');
+    expect(parentScope('proj:app/file:auth.ts')).toBe('proj:app');
+  });
+
+  it('returns undefined for a root project scope', () => {
+    expect(parentScope('proj:app')).toBeUndefined();
+  });
+});
+
+describe('buildScope errors', () => {
+  it('rejects an empty segment value', () => {
+    expect(() => scopeOf(['proj', ''])).toThrow();
+    expect(() => buildScope([{ kind: 'file', value: '' }])).toThrow();
   });
 });
