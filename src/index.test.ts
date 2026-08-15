@@ -4,6 +4,7 @@
  * a process. Heavy dependencies are mocked.
  */
 
+import { realpathSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -56,6 +57,14 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase }));
+// Partial fs mock: realpathSync DEFAULTS to the real implementation; only the
+// isMainEntryPoint case-fold test swaps in an identity resolver, so differently-
+// cased paths stay "resolvable" on every host filesystem (Linux CI cannot
+// resolve a differently-cased real path — the historical run-#5 failure).
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, realpathSync: vi.fn(actual.realpathSync) };
+});
 vi.mock('./db/schema.js', () => ({ migrate: mocks.migrate, assertFts5: mocks.assertFts5 }));
 vi.mock('./db/queries.js', () => ({ dbStats: mocks.dbStats }));
 vi.mock('./engine/embedding.js', () => ({ getSharedEmbedder: mocks.getSharedEmbedder }));
@@ -70,10 +79,23 @@ describe('isMainEntryPoint', () => {
   });
 
   it('matches case-insensitively on win32, sensitively elsewhere', () => {
+    // Hermetic: with an identity realpath resolver the comparison is purely
+    // string-level, so the win32 lowercasing inside isMainEntryPoint is the
+    // ONLY thing that can make a differently-cased argv[1] agree. A real
+    // case-sensitive filesystem (Linux CI) cannot resolve a differently-cased
+    // real path at all — that is what broke CI run #5.
+    const url = pathToFileURL('/Repo/Src/index.ts').href; // contains uppercase on every platform
+    const realArgv = fileURLToPath(url);
+    const foldedArgv = realArgv.toLowerCase();
+    // Double-cast: realpathSync is overloaded; identity keeps each call's input.
+    const identity = ((p: string) => p) as unknown as typeof realpathSync;
+    vi.mocked(realpathSync).mockImplementationOnce(identity).mockImplementationOnce(identity);
+    expect(isMainEntryPoint(url, foldedArgv, undefined, 'win32')).toBe(true);
+    vi.mocked(realpathSync).mockImplementationOnce(identity).mockImplementationOnce(identity);
+    expect(isMainEntryPoint(url, foldedArgv, undefined, 'linux')).toBe(false);
+    // Once-mocks exhausted -> real resolution again: exact match passes, an
+    // unresolvable suffix path falls through to metaMain and fails.
     const real = fileURLToPath(import.meta.url);
-    // win32: realpath resolves case-insensitively, so lower-casing both sides matches
-    expect(isMainEntryPoint(import.meta.url, real.toLowerCase(), undefined, 'win32')).toBe(true);
-    // posix: exact realpath match required; an unresolvable suffix path -> false
     expect(isMainEntryPoint(import.meta.url, real, undefined, 'linux')).toBe(true);
     expect(isMainEntryPoint(import.meta.url, `${real}.nope`, undefined, 'linux')).toBe(false);
   });

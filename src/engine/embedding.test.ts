@@ -71,12 +71,15 @@ describe('createEmbedder / configuration', () => {
 
   it('reads env vars when no options are given', () => {
     vi.stubEnv('SYNAPSE_EMBEDDING_MODEL', 'env/model');
-    vi.stubEnv('SYNAPSE_MODEL_DIR', 'C:\\models');
+    // POSIX absolute: resolves identically through path.resolve on every OS.
+    // A Windows drive-letter path ('C:\models') is treated as a relative
+    // FILENAME on Linux and gets cwd prepended — that broke CI (run #5).
+    vi.stubEnv('SYNAPSE_MODEL_DIR', '/tmp/env-models');
     vi.stubEnv('SYNAPSE_ALLOW_REMOTE_MODEL', '1');
     const embedder = createEmbedder();
     expect(embedder.modelId).toBe('env/model');
     expect(envMock.allowRemoteModels).toBe(true);
-    expect(envMock.localModelPath).toBe('C:\\models');
+    expect(envMock.localModelPath).toBe(resolve('/tmp/env-models'));
   });
 });
 
