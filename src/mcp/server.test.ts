@@ -174,7 +174,7 @@ describe('runSse (end-to-end over HTTP)', () => {
       const toolsResp = await toolsWait;
       const tools = ((toolsResp['result'] as { tools?: { name: string }[] }).tools ?? []).map((t) => t.name);
       expect(tools).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
-      expect(tools).toHaveLength(6);
+      expect(tools).toHaveLength(8);
     } finally {
       await handle.close();
     }
@@ -242,48 +242,76 @@ describe('runSse (end-to-end over HTTP)', () => {
     }
   });
 
-  it('returns 500 when the SDK transport rejects a second connection', async () => {
+  it('serves two concurrent SSE sessions (per-connection McpServer)', async () => {
     const handle = await runSse(ctx, 0);
     const port = (handle.server.address() as AddressInfo).port;
     try {
-      // 1. Establish one live SSE session and wait for its endpoint event —
-      //    this proves mcpServer.connect() has completed.
-      const firstStream = http.get({ host: '127.0.0.1', port, path: '/sse' });
-      const endpoint = await new Promise<string>((resolve, reject) => {
-        firstStream.on('response', (res) => {
-          if (res.statusCode !== 200) {
-            reject(new Error('first GET /sse returned ' + res.statusCode));
-            return;
-          }
-          let buf = '';
-          res.on('data', (chunk) => {
-            buf += chunk.toString();
-            const match = /data: (\/messages\?sessionId=[^\n]+)/.exec(buf);
-            if (match !== null) {
-              res.removeAllListeners('data');
-              resolve(match[1]!);
+      /** Open one SSE stream and resolve its POST endpoint from the endpoint event. */
+      const openSession = (): Promise<{ endpoint: string; res: http.IncomingMessage }> =>
+        new Promise((resolve, reject) => {
+          const req = http.get({ host: '127.0.0.1', port, path: '/sse' }, (res) => {
+            if (res.statusCode !== 200) {
+              reject(new Error('GET /sse returned ' + res.statusCode));
+              return;
             }
+            let buf = '';
+            res.on('data', (chunk) => {
+              buf += chunk.toString();
+              const match = /data: (\/messages\?sessionId=[^\n]+)/.exec(buf);
+              if (match !== null) {
+                res.removeAllListeners('data');
+                resolve({ endpoint: match[1]!, res });
+              }
+            });
           });
+          req.on('error', reject);
         });
-        firstStream.on('error', reject);
-      });
 
-      // 2. A second SSE connection reuses the SAME McpServer, whose
-      //    connect() throws "Already connected" — handled as HTTP 500.
-      const secondStatus = await new Promise<number>((resolve, reject) => {
-        http
-          .get({ host: '127.0.0.1', port, path: '/sse' }, (res) => {
-            res.resume();
-            res.on('end', () => resolve(res.statusCode ?? 0));
-          })
-          .on('error', reject);
-      });
-      expect(endpoint.startsWith('/messages?sessionId=')).toBe(true);
-      expect(secondStatus).toBe(500);
+      // Session 1
+      const first = await openSession();
+      // Session 2 while session 1 is still open — the old shared-McpServer
+      // design returned 500 ("Already connected") here; per-connection
+      // servers must accept it.
+      const second = await openSession();
+      expect(first.endpoint).not.toBe(second.endpoint); // distinct sessions
+
+      const post = (path: string, body: unknown): Promise<number> =>
+        new Promise((resolve, reject) => {
+          const req = http.request(
+            {
+              host: '127.0.0.1',
+              port,
+              path,
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+            },
+            (res) => {
+              res.resume();
+              res.on('end', () => resolve(res.statusCode ?? 0));
+            },
+          );
+          req.on('error', reject);
+          req.write(JSON.stringify(body));
+          req.end();
+        });
+
+      // Both sessions accept initialize (202) simultaneously.
+      const initBody = {
+        jsonrpc: '2.0' as const,
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'concurrent-test', version: '0' } },
+      };
+      const [status1, status2] = await Promise.all([post(first.endpoint, initBody), post(second.endpoint, initBody)]);
+      expect(status1).toBe(202);
+      expect(status2).toBe(202);
+
+      first.res.destroy();
+      second.res.destroy();
     } finally {
       await handle.close();
     }
-  });
+  }, 30_000);
 });
 
 describe('runStdio', () => {

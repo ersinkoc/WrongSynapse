@@ -39,45 +39,59 @@ export interface SseServerHandle {
 
 /** Run the MCP server over SSE on the given port; returns once listening. */
 export async function runSse(ctx: ToolContext, port: number): Promise<SseServerHandle> {
-  const mcpServer = createSynapseServer(ctx);
   const httpServer = createServer();
-  const transports = new Map<string, SSEServerTransport>();
+  // One McpServer per SSE session: the SDK's Protocol accepts a single
+  // transport per server instance, so sharing one server across connections
+  // made every client after the first fail with "Already connected" (500).
+  const sessions = new Map<string, { transport: SSEServerTransport; server: McpServer }>();
 
   const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    // Node always populates req.url for parsed requests; the fallback guards
-    // only against non-standard embedding hosts.
-    /* v8 ignore next */
-    const url = new URL(req.url ?? '/', `http://${req.headers['host'] ?? 'localhost'}`);
     try {
+      // Node always populates req.url for parsed requests; the fallback guards
+      // only against non-standard embedding hosts. Parsing INSIDE the try so a
+      // malformed request line surfaces as HTTP 500, not an unhandled throw.
+      /* v8 ignore next */
+      const url = new URL(req.url ?? '/', `http://${req.headers['host'] ?? 'localhost'}`);
       if (req.method === 'GET' && url.pathname === '/sse') {
+        const server = createSynapseServer(ctx);
         const transport = new SSEServerTransport('/messages', res);
-        const sessionId = transport.sessionId;
-        transports.set(sessionId, transport);
+        sessions.set(transport.sessionId, { transport, server });
         res.on('close', () => {
-          transports.delete(sessionId);
+          sessions.delete(transport.sessionId);
         });
-        await mcpServer.connect(transport);
+        await server.connect(transport);
         return;
       }
       if (req.method === 'POST' && url.pathname === '/messages') {
         const sessionId = url.searchParams.get('sessionId');
-        const transport = sessionId !== null ? transports.get(sessionId) : undefined;
-        if (transport === undefined) {
+        const session = sessionId !== null ? sessions.get(sessionId) : undefined;
+        if (session === undefined) {
           res.writeHead(400, { 'content-type': 'text/plain' });
           res.end('Unknown session');
           return;
         }
-        await transport.handlePostMessage(req, res);
+        await session.transport.handlePostMessage(req, res);
         return;
       }
       res.writeHead(404, { 'content-type': 'text/plain' });
       res.end('Not found');
     } catch (error) {
-      res.writeHead(500, { 'content-type': 'text/plain' });
-      // Every throw site in this handler (URL parsing, the SDK transports)
-      // produces Error instances; the String() arm is defensive.
-      /* v8 ignore next */
-      res.end(error instanceof Error ? error.message : String(error));
+      // Defensive: the SDK transports report protocol errors in-band, and
+      // Node's HTTP parser rejects malformed request lines before this
+      // handler runs. But SSEServerTransport.handlePostMessage can THROW
+      // after already writing a response (e.g. "SSE connection not
+      // established": writeHead(500).end() then throw) — calling writeHead
+      // again would raise ERR_HTTP_HEADERS_SENT and crash the request, so
+      // destroy the socket instead. Not reachable through the SDK's normal
+      // error paths; annotated per the codebase's defensive-arm convention.
+      /* v8 ignore start */
+      if (res.headersSent) {
+        res.destroy();
+      } else {
+        res.writeHead(500, { 'content-type': 'text/plain' });
+        res.end(error instanceof Error ? error.message : String(error));
+      }
+      /* v8 ignore stop */
     }
   };
 
@@ -88,10 +102,14 @@ export async function runSse(ctx: ToolContext, port: number): Promise<SseServerH
   await new Promise<void>((resolvePromise) => httpServer.listen(port, resolvePromise));
 
   const close = async (): Promise<void> => {
-    try {
-      await mcpServer.close();
-    } catch {
-      // server may already be closed
+    // Close every live session's server (ends its SSE response, which fires
+    // the 'close' cleanup above), then the HTTP listener.
+    for (const { server } of sessions.values()) {
+      try {
+        await server.close();
+      } catch {
+        // server may already be closed
+      }
     }
     await new Promise<void>((resolvePromise) => httpServer.close(() => resolvePromise()));
   };
