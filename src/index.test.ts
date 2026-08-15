@@ -133,9 +133,39 @@ describe('CLI main()', () => {
     log.mockRestore();
   });
 
+  it('rejects an invalid transport before opening a database', async () => {
+    await expect(main(['--transport', 'ws'])).rejects.toThrow(/invalid transport 'ws'/);
+    expect(mocks.openDatabase).not.toHaveBeenCalled();
+  });
+
   it('starts the stdio server by default', async () => {
     await main([]);
     expect(mocks.runStdio).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the database open while the stdio server is connected', async () => {
+    // runStdio() resolves at CONNECT time (SDK semantics), long before the
+    // client disconnects — main() must NOT close the DB there. Signal-driven
+    // shutdown (SIGINT/SIGTERM) owns the close; see the lifecycle tests below.
+    const close = vi.fn();
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
+      transaction: <T>(fn: () => T): T => fn(), close,
+    });
+    await main([]);
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it('closes the database after the SSE server shuts down', async () => {
+    // The mocked runSse emits 'close' on the next tick; the DB must be closed
+    // exactly once AFTER that event (and only then).
+    const close = vi.fn();
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
+      transaction: <T>(fn: () => T): T => fn(), close,
+    });
+    await main(['--transport', 'sse', '--port', '9998']);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it('starts the SSE server with --transport sse and --port', async () => {

@@ -57,6 +57,7 @@ ENVIRONMENT
   SYNAPSE_MODEL_DIR         Local model directory (offline inference)
   SYNAPSE_EMBEDDING_MODEL   Override embedding model id (default Xenova/all-MiniLM-L6-v2)
   SYNAPSE_ALLOW_REMOTE_MODEL  Set to 1 to allow a one-time model download (then go offline)
+  SYNAPSE_PORT              SSE HTTP port when --port is absent (default 8765)
 
 MCP TOOLS
 ${TOOL_DEFINITIONS.map((t) => `  ${t.name} — ${t.description.split('.')[0]}.`).join('\n')}
@@ -88,6 +89,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (cli.version === true) {
     console.log(SERVER_VERSION);
     return;
+  }
+  // Fail fast on a typo'd transport BEFORE opening a database (otherwise
+  // `--transport sse2` would silently start stdio and create a stray synapse.db).
+  if (cli.transport !== 'stdio' && cli.transport !== 'sse') {
+    throw new Error(`invalid transport '${cli.transport}' (expected 'stdio' or 'sse')`);
   }
 
   // Flag > env > default resolution keeps every arm observable (parseArgs
@@ -126,9 +132,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     await new Promise<void>((resolvePromise) => {
       handle.server.on('close', resolvePromise);
     });
+    // The SSE branch genuinely awaits server shutdown (the 'close' event
+    // fires only after every connection ended), so closing the DB here is
+    // safe. Null the global first: a later signal would otherwise re-close it.
+    activeDb = null;
+    db.close();
   } else {
     await runStdio(ctx);
   }
+  // NOTE: no in-band db.close() for stdio. runStdio() resolves once the
+  // transport is CONNECTED (SDK semantics — start() only attaches listeners),
+  // not when the client disconnects, so closing here would pull the DB out
+  // from under a live server. The DB lifecycle for server modes is owned by
+  // the entry-point signal handlers (SIGINT/SIGTERM → shutdown() → activeDb.close()).
 }
 
 /** The live database for the CLI process (for signal-driven shutdown). */
