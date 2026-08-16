@@ -3,7 +3,7 @@
 **Local-first Cognitive Memory Operating System + Model Context Protocol (MCP) server** for autonomous AI coding agents.
 
 [![CI](https://github.com/ersinkoc/WrongSynapse/actions/workflows/ci.yml/badge.svg)](https://github.com/ersinkoc/WrongSynapse/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.1.0-007EC6)](CHANGELOG.md)
+[![npm](https://img.shields.io/npm/v/wrongsynapse)](https://www.npmjs.com/package/wrongsynapse)
 [![License: MIT](https://img.shields.io/badge/license-MIT-007EC6)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522-339933)](package.json)
 
@@ -29,32 +29,38 @@ The three channels are fused with **Reciprocal Rank Fusion (RRF, k = 60)** into 
 ## Quickstart
 
 ```bash
-git clone https://github.com/ersinkoc/WrongSynapse.git
-cd WrongSynapse
-npm install
-npm run build
+# install the published package
+npm install -g wrongsynapse
 
-# one-time model download (after this everything runs offline)
-# then index this repo to populate ./synapse.db
+# one-time model download (after this everything runs offline),
+# then index your workspace to populate ./synapse.db
 
 # PowerShell
 $env:SYNAPSE_ALLOW_REMOTE_MODEL = "1"
-node dist/index.js --index .
+wrongsynapse --index .
 Remove-Item Env:SYNAPSE_ALLOW_REMOTE_MODEL
 
 # bash / zsh
-SYNAPSE_ALLOW_REMOTE_MODEL=1 node dist/index.js --index .
+SYNAPSE_ALLOW_REMOTE_MODEL=1 wrongsynapse --index .
 unset SYNAPSE_ALLOW_REMOTE_MODEL
 
 # start the MCP server (stdio by default)
-node dist/index.js
+wrongsynapse
+```
+
+Prefer not to install globally? `npx wrongsynapse --index .` works the same (the one-time model download is cached per machine), or build from source:
+
+```bash
+git clone https://github.com/ersinkoc/WrongSynapse.git
+cd WrongSynapse && npm install && npm run build
+node dist/index.js --index .   # same CLI, from the repo
 ```
 
 The `--index .` run prints JSON stats (files scanned/parsed, symbols, relations, embeddings) and creates `./synapse.db`.
 
 ### Connecting an MCP client
 
-WrongSynapse speaks the Model Context Protocol over stdio or SSE. Point any MCP client at the built entry point:
+WrongSynapse speaks the Model Context Protocol over stdio or SSE. Point any MCP client at the installed CLI:
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -62,20 +68,19 @@ WrongSynapse speaks the Model Context Protocol over stdio or SSE. Point any MCP 
 {
   "mcpServers": {
     "wrongsynapse": {
-      "command": "node",
-      "args": ["D:/path/to/WrongSynapse/dist/index.js"],
+      "command": "wrongsynapse",
       "env": { "SYNAPSE_DB_PATH": "D:/path/to/synapse.db" }
     }
   }
 }
 ```
 
-**Cursor / any stdio MCP client** — command `node dist/index.js` in the repo (or a global install), then the eight `synapse_*` tools appear.
+**Cursor / any stdio MCP client** — command `wrongsynapse` (installed globally or via `npx wrongsynapse`), then the eight `synapse_*` tools appear.
 
 **SSE (remote / concurrent clients)**:
 
 ```bash
-node dist/index.js --transport sse --port 8765
+wrongsynapse --transport sse --port 8765
 # endpoint: http://localhost:8765/sse
 ```
 
