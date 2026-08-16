@@ -1,6 +1,6 @@
 {
   "name": "wrongsynapse",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Local-first Cognitive Memory Operating System and MCP server for autonomous AI coding agents. Tri-hybrid retrieval: ONNX semantic embeddings + SQLite FTS5/BM25 + hierarchical knowledge graph, fused with Reciprocal Rank Fusion. Zero cloud.",
   "type": "module",
   "license": "MIT",
