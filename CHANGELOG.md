@@ -7,17 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-16
+
+Patch release: ship the agent skill and the global-install cache fix that
+the 0.1.0 tarball lacks.
+
 ### Added
 
+- **Agent skill** (`skills/wrongsynapse/SKILL.md`) — a
+  [skills.sh](https://www.skills.sh/)-compatible skill that automates the
+  memory workflow for coding agents (recall via `synapse_hybrid_query`
+  before work, observations with `[domain-term]` tags during work,
+  candidate consolidation at task end). Installable with
+  `npx skills add ersinkoc/WrongSynapse`; the `skills/` directory now ships
+  in the npm package.
 - `prepublishOnly` guard in `package.json`: `npm publish` now runs
   typecheck + full test suite + build before packing, so a publish can never
   ship a stale or red `dist/`.
+- `npm run release` / `npm run release:check` — interactive release script
+  (pre-flight gates → publish with 2FA → registry verify → tag push) for
+  maintainers.
+
+### Fixed
+
+- **Global-install model cache**: transformers.js roots its download cache
+  (`env.cacheDir`) and local-model read path (`env.localModelPath`) inside
+  `node_modules` of the package — for a global `npm i -g wrongsynapse`
+  install that is the global install tree, so every reinstall re-downloaded
+  the embedding model. Both knobs now default to
+  `~/.cache/wrongsynapse` (HOME/USERPROFILE; `./.cache` fallback);
+  `SYNAPSE_MODEL_DIR` still overrides both.
 
 ### Changed
 
-- **Documentation**: README restructured (requirements, MCP client setup, CLI
-  reference, programmatic usage, data model, development guide); CHANGELOG
-  added.
+- **Documentation**: README now leads with the published-package workflow
+  (`npm install -g wrongsynapse`, real npm badge, MCP configs using the
+  installed CLI, skills.sh install section).
 
 ## [0.1.0] — 2026-08-15
 
@@ -86,5 +111,6 @@ SQLite entity graph, fully offline.
   coverage enforced in CI (Node 22 + 24 matrix), typecheck and build gates,
   and an `npm audit` (high/critical) gate.
 
-[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ersinkoc/WrongSynapse/releases/tag/v0.1.0
