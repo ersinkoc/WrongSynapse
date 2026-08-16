@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-08-16
+
+Patch release: the 0.1.2 tarball shipped docs for the admin web UI but not
+its code, and `--version` printed a hardcoded 0.1.0. This release ships the
+real thing.
+
+### Added
+
+- **Admin web UI (actually shipped this time)** — the 0.1.2 CHANGELOG
+  described the web UI, but the earlier feature commit turned out to be
+  docs-only; the code lived in dropped stashes and never reached the
+  tarball. Recovered and committed: `--no-web` / `SYNAPSE_WEB=0` opt-out,
+  `--web-port` / `SYNAPSE_WEB_PORT` (kernel-assigned by default),
+  `--web-open` / `SYNAPSE_WEB_OPEN` browser auto-open, bearer-token
+  gating for destructive endpoints, and the React 19 + Tailwind v4 + Radix
+  UI + React Flow SPA (three tabs: Statistics, Memory, Graph). The CLI
+  help now documents every web flag.
+- **End-to-end auth tests over real HTTP** — the production auth path
+  (Authorization header → HTTP shell → route enforcement) is exercised
+  through an actual socket: 401 for missing/wrong tokens, 200 for a valid
+  bearer; constant-time comparator covered at the route level.
+
+### Fixed
+
+- **`wrongsynapse --version` reported 0.1.0 on every release** —
+  `SERVER_VERSION` was a hardcoded literal that never followed the
+  package.json bumps (0.1.0 → 0.1.2 all printed 0.1.0). It is now derived
+  from `package.json` at module load via `createRequire`, the single
+  source of truth; the CLI banner, `--version`, and the MCP handshake
+  can no longer drift from the published version.
+- **`--web-port 9090` failed with "Unknown option"** — root cause was the
+  missing web wiring above; the recovered `src/index.ts` registers all
+  web flags, env fallbacks, and the background boot with bind-failure
+  tolerance (MCP servers keep running when the port is unavailable).
+
+### Changed
+
+- Model cache and auth-gating tests extended to keep the 100% coverage
+  gate green across platforms (OS-specific browser-opener arms annotated;
+  source-side graph-neighbor expansion covered).
+
 ## [0.1.2] — 2026-08-16
 
 Patch release: ship the agent skill, the global-install cache fix, and the
