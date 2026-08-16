@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Optional admin web UI** — a single-page admin panel for inspecting and
   pruning the memory database without going through the MCP tools. Built
   with React 19 + Tailwind CSS v4 + Radix UI Themes 3 + React Flow 12,
-  served from the same Node process as the MCP server, and disabled by
-  default behind a flag.
+  served from the same Node process as the MCP server. Opt-out (boots by
+  default; disable with `--no-web` or `SYNAPSE_WEB=0`).
 
   - Three tabs:
     - **Statistics** — counts (entities, relations, vectors, candidates,
