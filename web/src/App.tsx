@@ -4,14 +4,17 @@ import { Box, Container, Flex, Heading, Tabs, Text, Badge, Spinner } from '@radi
 import Stats from './components/Stats';
 import MemoryList from './components/MemoryList';
 import MemoryGraph from './components/MemoryGraph';
+import SearchPanel from './components/SearchPanel';
 import { api } from './api';
 
 /**
  * Single-page admin shell.
  *
- * Three tabs (Stats / Memory / Graph) matching the three product surfaces the
- * user requested. The header carries the server version + health badge so an
- * operator can confirm the SPA is talking to a live backend at a glance.
+ * Four tabs (Search / Stats / Memory / Graph) matching the product surfaces:
+ * tri-hybrid retrieval with scores, database statistics, the memory list,
+ * and the graph visualisation. The header carries the server version +
+ * health badge so an operator can confirm the SPA is talking to a live
+ * backend at a glance.
  */
 export default function App() {
   const [health, setHealth] = useState<{ ok: boolean; version: string } | null>(null);
@@ -83,14 +86,18 @@ export default function App() {
       </Box>
 
       <Container size="4" px="4" py="5">
-        <Tabs.Root defaultValue="memory">
+        <Tabs.Root defaultValue="search">
           <Tabs.List>
+            <Tabs.Trigger value="search">Search</Tabs.Trigger>
             <Tabs.Trigger value="stats">Statistics</Tabs.Trigger>
             <Tabs.Trigger value="memory">Memory</Tabs.Trigger>
             <Tabs.Trigger value="graph">Graph</Tabs.Trigger>
           </Tabs.List>
 
           <Box pt="4">
+            <Tabs.Content value="search">
+              <SearchPanel />
+            </Tabs.Content>
             <Tabs.Content value="stats">
               <Stats />
             </Tabs.Content>

@@ -71,6 +71,23 @@ export interface MemoryGraph {
   }>;
 }
 
+/** One tri-hybrid search hit: the fused RRF score plus per-channel ranks. */
+export interface SearchResult {
+  score: number;
+  ranks: { fts: number | null; vector: number | null; graph: number | null };
+  matched_scopes: string[];
+  entity: MemorySummary;
+  graph_paths: Array<{ relation: string; source: string; target: string }>;
+}
+
+export interface SearchResponse {
+  query: string;
+  count: number;
+  results: SearchResult[];
+  warnings: string[];
+  vector_retrieval_used: boolean;
+}
+
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message);
@@ -129,4 +146,26 @@ export const api = {
 
   memoryGraph: (limit = 500): Promise<MemoryGraph> =>
     request(`/api/graph/memory?limit=${String(limit)}`),
+
+  search: (params: {
+    q: string;
+    scope?: string;
+    types?: string[];
+    limit?: number;
+    vectorWeight?: number;
+    lexicalWeight?: number;
+    graphWeight?: number;
+    graphDepth?: number;
+  }): Promise<SearchResponse> => {
+    const search = new URLSearchParams();
+    search.set('q', params.q);
+    if (params.scope !== undefined) search.set('scope', params.scope);
+    for (const type of params.types ?? []) search.append('type', type);
+    if (params.limit !== undefined) search.set('limit', String(params.limit));
+    if (params.vectorWeight !== undefined) search.set('vector_weight', String(params.vectorWeight));
+    if (params.lexicalWeight !== undefined) search.set('lexical_weight', String(params.lexicalWeight));
+    if (params.graphWeight !== undefined) search.set('graph_weight', String(params.graphWeight));
+    if (params.graphDepth !== undefined) search.set('graph_depth', String(params.graphDepth));
+    return request(`/api/search?${search.toString()}`);
+  },
 };

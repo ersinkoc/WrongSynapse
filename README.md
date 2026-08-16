@@ -34,12 +34,13 @@ with React 19 + Tailwind CSS v4 + Radix UI Themes 3 + React Flow 12,
 uses a dark-pro design palette, and lives entirely in the same Node
 process as the MCP server — no second port, no second process.
 
-Three tabs cover the surface the MCP tools expose:
+Four tabs cover the surface the MCP tools expose:
 
 | Tab | What it shows |
 |---|---|
+| **Search** | Tri-hybrid retrieval in the browser — the same engine behind the `synapse_hybrid_query` MCP tool (FTS5/BM25 + semantic embeddings + graph expansion, fused with RRF). Tune channel weights, graph depth, limit, and a scope prefix; every hit shows its fused score (with a bar relative to the top result) and the per-channel ranks (`FTS #1`, `VEC #2`, `GRAPH —`) that produced it, plus warnings when the semantic channel is unavailable |
 | **Statistics** | Entity / relation / vector / candidate / FTS-row counts, plus a per-type breakdown of entities and relations |
-| **Memory** | Searchable list of every `memory_entry` (filter by scope or free-text); click a row for the full detail panel (scope, name, content, metadata, anchored-to graph paths, confidence, updated timestamp); remove with a confirmation dialog |
+| **Memory** | Searchable list of every `memory_entry` (filter by scope and/or free-text); click a row for the full detail panel (scope, name, content, metadata, anchored-to graph paths, confidence, updated timestamp); remove with a confirmation dialog |
 | **Graph** | React Flow visualisation: every `memory_entry` plus the non-memory endpoints of every relation that touches one. Pan, zoom, fit-to-view. |
 
 The UI is opt-out, not opt-in — it boots by default. Disable it with
@@ -66,8 +67,9 @@ The web server binds to `127.0.0.1` only and **never governs process
 lifetime** (`httpServer.unref()`); a web-bind failure logs a warning and
 the MCP server continues unaffected. Destructive operations (DELETE
 `/api/memory/:id`) require an `Authorization: Bearer <token>` header
-where the token is a random hex string printed next to the listen URL at
-boot — read-only endpoints (stats, list, graph) are open.
+where the token is a random hex string generated at every boot and printed
+to stderr on the line after the listen URL (`admin web UI delete token:
+…`) — read-only endpoints (health, stats, search, list, graph) are open.
 
 The SPA is built separately from the Node bundle so the published npm
 package stays lean. From a checkout:
@@ -90,7 +92,8 @@ against the admin panel):
 |---|---|---|
 | `GET` | `/api/health` | `{ ok, version }` |
 | `GET` | `/api/stats` | counts + type/relation breakdowns |
-| `GET` | `/api/memory?scope=…&q=…&limit=…` | `{ count, memories[] }` |
+| `GET` | `/api/search?q=…&scope=…&type=…&limit=…&vector_weight=…&lexical_weight=…&graph_weight=…&graph_depth=…` | tri-hybrid RRF results: `{ results[{ score, ranks{fts,vector,graph}, entity, graph_paths }], warnings, vector_retrieval_used }` |
+| `GET` | `/api/memory?scope=…&q=…&limit=…` | `{ count, memories[] }` (scope and q compose) |
 | `GET` | `/api/memory/:id` | one memory + its anchored graph paths |
 | `DELETE` | `/api/memory/:id` | `{ id, deleted: true }` (Bearer auth required) |
 | `GET` | `/api/candidates?status=…&limit=…` | `{ count, candidates[] }` |

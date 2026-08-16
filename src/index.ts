@@ -15,6 +15,7 @@
  */
 
 import { realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -25,7 +26,7 @@ import { dbStats } from './db/queries.js';
 import { getSharedEmbedder } from './engine/embedding.js';
 import { indexWorkspace } from './engine/parser.js';
 import { DemoFeeder, DEFAULT_DEMO_INTERVAL_MS, DEFAULT_DEMO_SEED } from './engine/demo.js';
-import { runSse, runStdio, SERVER_VERSION } from './mcp/server.js';
+import { runSse, runStdio, SERVER_VERSION, type SseServerHandle } from './mcp/server.js';
 import { TOOL_DEFINITIONS } from './mcp/tools/definitions.js';
 import { runWebServer, type WebServerHandle } from './web/server.js';
 
@@ -276,9 +277,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (shouldStartWeb(cli)) {
     const webPort = resolveWebPort(cli) ?? 0;
     const spaDir = resolveSpaStaticDir(import.meta.url, dirname(fileURLToPath(import.meta.url)));
-    web = await runWebServer({ db, staticDir: spaDir, layoutSeed: resolveDemoSeed(cli) }, webPort);
+    // Boot-time bearer token for destructive web operations (DELETE). Printed
+    // next to the listen URL so an operator sitting at the terminal can copy
+    // it; read-only endpoints stay open (the server binds to 127.0.0.1).
+    const authToken = randomBytes(24).toString('hex');
+    web = await runWebServer(
+      { db, embedder, staticDir: spaDir, layoutSeed: resolveDemoSeed(cli), authToken },
+      webPort,
+    );
     if (web.port > 0) {
       console.error(`WrongSynapse admin web UI listening on ${web.url}`);
+      console.error(`WrongSynapse admin web UI delete token: ${authToken}`);
       if (shouldAutoOpenBrowser(cli)) {
         void maybeOpenBrowser(web.url);
       }
@@ -314,6 +323,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
     const handle = await runSse(ctx, port);
     console.error(`WrongSynapse SSE server listening on http://localhost:${port}/sse`);
+    activeSse = handle;
     const demo = startDemo();
     activeDemo = demo;
     await new Promise<void>((resolvePromise) => {
@@ -321,13 +331,27 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     });
     // The SSE branch genuinely awaits server shutdown (the 'close' event
     // fires only after every connection ended), so closing the DB here is
-    // safe. Null the globals first: a later signal would otherwise re-close them.
-    await demo?.stop();
+    // safe. A signal-driven shutdown() may have already torn some of these
+    // down — every close is best-effort so the two paths can interleave.
+    try {
+      await demo?.stop();
+    } catch {
+      // best-effort stop
+    }
     activeDemo = null;
-    if (web !== null) await web.close();
+    try {
+      if (web !== null) await web.close();
+    } catch {
+      // best-effort close
+    }
     activeWeb = null;
+    activeSse = null;
     activeDb = null;
-    db.close();
+    try {
+      db.close();
+    } catch {
+      // best-effort close (already closed by a signal-driven shutdown)
+    }
   } else {
     await runStdio(ctx);
     activeDemo = startDemo();
@@ -344,6 +368,9 @@ let activeDb: SynapseDatabase | null = null;
 
 /** The live admin web server for the CLI process (for signal-driven shutdown). */
 let activeWeb: WebServerHandle | null = null;
+
+/** The live SSE MCP server for the CLI process (for signal-driven shutdown). */
+let activeSse: SseServerHandle | null = null;
 
 /** The live demo feeder for the CLI process (for signal-driven shutdown). */
 let activeDemo: DemoFeeder | null = null;
@@ -363,7 +390,14 @@ function shutdown(): Promise<void> {
       // best-effort stop on exit
     }
     try {
-      void activeWeb?.close();
+      // Closing the SSE server ends its sessions cleanly (and resolves the
+      // SSE branch's in-band cleanup, whose own closes are best-effort).
+      await activeSse?.close();
+    } catch {
+      // best-effort close on exit
+    }
+    try {
+      await activeWeb?.close();
     } catch {
       // best-effort close on exit
     }

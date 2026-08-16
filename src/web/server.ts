@@ -36,6 +36,9 @@ import {
 import type { SynapseDatabase } from '../db/connection.js';
 import { SERVER_VERSION } from '../mcp/server.js';
 import { createDemoRng } from '../engine/demo.js';
+import { hybridSearch, type HybridResult } from '../engine/hybrid-search.js';
+import type { Embedder } from '../engine/embedding.js';
+import { scopeMatchesAnyPrefix } from '../utils/scope.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +46,12 @@ import { createDemoRng } from '../engine/demo.js';
 
 export interface WebContext {
   db: SynapseDatabase;
+  /**
+   * Embedder powering the semantic channel of `GET /api/search`. Optional:
+   * when absent the endpoint still answers — hybridSearch degrades to
+   * lexical + graph retrieval and reports a warning.
+   */
+  embedder?: Embedder;
   /** Absolute path to the static SPA directory (may not exist on disk). */
   staticDir?: string;
   /**
@@ -51,6 +60,8 @@ export interface WebContext {
    * seed always yields the same coordinates; the SPA honors payload
    * positions instead of stacking nodes. Absent → server sends no
    * position and the SPA falls back to its local two-column grid.
+   * (The CLI always sets it — `--demo-seed`, default 42 — so every boot
+   * serves a deterministic layout.)
    */
   layoutSeed?: number;
   /**
@@ -521,7 +532,7 @@ export interface RouteRequest {
   authorization?: string;
 }
 
-export function route(req: RouteRequest, ctx: WebContext): WebResponse {
+export function route(req: RouteRequest, ctx: WebContext): WebResponse | null {
   const { method, rawUrl } = req;
   const url = new URL(rawUrl, 'http://localhost');
   const path = url.pathname;
@@ -567,11 +578,27 @@ export function route(req: RouteRequest, ctx: WebContext): WebResponse {
 
   // Static SPA fallback is handled by runWebServer (needs fs); here we only
   // decide whether the request is API or static. API paths that miss every
-  // branch above get a 404.
+  // branch above get a 404. A null return tells the HTTP shell to try static
+  // asset serving (async endpoints live in routeAsync, not here).
   if (path.startsWith('/api/')) {
     return errorResponse(404, `unknown api endpoint: ${method} ${path}`);
   }
-  return null as unknown as WebResponse;
+  return null;
+}
+
+/**
+ * Async routing layer. Endpoints whose handlers await — search runs the
+ * tri-hybrid embedding pipeline — dispatch here; everything else delegates
+ * to the synchronous {@link route}. The HTTP shell always dispatches through
+ * this function: `await` on a plain WebResponse is a no-op, so sync handlers
+ * keep their direct-return contract for tests.
+ */
+export async function routeAsync(req: RouteRequest, ctx: WebContext): Promise<WebResponse | null> {
+  const url = new URL(req.rawUrl, 'http://localhost');
+  if (req.method === 'GET' && url.pathname === '/api/search') {
+    return handleSearch(ctx, url);
+  }
+  return route(req, ctx);
 }
 
 /**
@@ -595,11 +622,16 @@ function handleListMemory(ctx: WebContext, url: URL): WebResponse {
   const { scopePrefix, q, limit } = parseMemoryListParams(url);
   let entities: EntityRow[];
   if (q !== undefined && q !== '') {
+    // The FTS branch must honor the scope filter too — otherwise
+    // ?q=...&scope=... silently returned out-of-scope memories.
+    const scopePrefixes = scopePrefix !== undefined && scopePrefix !== '' ? [scopePrefix] : [];
     const ftsHits = searchFts(ctx.db, q, limit);
     const ordered: EntityRow[] = [];
     for (const hit of ftsHits) {
       const entity = getEntity(ctx.db, hit.entityId);
-      if (entity !== undefined && entity.type === 'memory_entry') ordered.push(entity);
+      if (entity === undefined || entity.type !== 'memory_entry') continue;
+      if (!scopeMatchesAnyPrefix(entity.scopePath, scopePrefixes)) continue;
+      ordered.push(entity);
     }
     entities = ordered;
   } else {
@@ -646,6 +678,105 @@ function handleListCandidates(ctx: WebContext, url: URL): WebResponse {
   return jsonResponse(200, {
     count: candidates.length,
     candidates: candidates.map(summarizeCandidate),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Tri-hybrid search (GET /api/search)
+// ---------------------------------------------------------------------------
+
+interface SearchParams {
+  query: string;
+  scopes: string[];
+  types: string[];
+  limit: number;
+  vectorWeight: number;
+  lexicalWeight: number;
+  graphWeight: number;
+  graphDepth: number;
+}
+
+/** Clamp a numeric query param into [0, 10]; missing/invalid → fallback. */
+function clampWeight(raw: string | null, fallback: number): number {
+  if (raw === null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.min(10, n);
+}
+
+function parseSearchParams(url: URL): SearchParams {
+  const list = (key: string): string[] => url.searchParams.getAll(key).filter((value) => value !== '');
+  return {
+    query: url.searchParams.get('q') ?? '',
+    scopes: list('scope'),
+    types: list('type'),
+    limit: clampLimit(url.searchParams.get('limit'), 10, 50),
+    vectorWeight: clampWeight(url.searchParams.get('vector_weight'), 1),
+    lexicalWeight: clampWeight(url.searchParams.get('lexical_weight'), 1),
+    graphWeight: clampWeight(url.searchParams.get('graph_weight'), 1),
+    graphDepth: clampLimit(url.searchParams.get('graph_depth'), 1, 3),
+  };
+}
+
+/**
+ * Stand-in used when the context carries no embedder: every call rejects, so
+ * hybridSearch's semantic channel degrades to a warning instead of crashing
+ * the endpoint. (The CLI always passes a real embedder; this guards library
+ * callers that build a WebContext with only a db.)
+ */
+const UNAVAILABLE_EMBEDDER: Embedder = {
+  modelId: 'unavailable',
+  dimension: 0,
+  /* v8 ignore start */
+  // hybridSearch awaits init() first and bails on rejection, so embed /
+  // embedBatch / isReady are unreachable through this server — they exist
+  // only to satisfy the Embedder interface.
+  isReady: () => false,
+  embed: () => Promise.reject(new Error('embedder not configured')),
+  embedBatch: () => Promise.reject(new Error('embedder not configured')),
+  /* v8 ignore stop */
+  init: () => Promise.reject(new Error('embedder not configured')),
+};
+
+function truncateText(text: string | null, max: number): string | null {
+  if (text === null) return null;
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** Project a HybridResult into the JSON shape the search tab renders. */
+function summarizeSearchResult(result: HybridResult): Record<string, unknown> {
+  return {
+    score: Math.round(result.score * 1e6) / 1e6,
+    ranks: result.ranks,
+    matched_scopes: result.matchedScopes,
+    entity: { ...summarizeEntity(result.entity), content: truncateText(result.entity.content, 500) },
+    graph_paths: result.graphPaths.map((path) => ({
+      relation: path.relation,
+      source: path.sourceName,
+      target: path.targetName,
+    })),
+  };
+}
+
+async function handleSearch(ctx: WebContext, url: URL): Promise<WebResponse> {
+  const params = parseSearchParams(url);
+  if (params.query.trim() === '') return errorResponse(400, 'missing required query parameter: q');
+  const output = await hybridSearch(ctx.db, ctx.embedder ?? UNAVAILABLE_EMBEDDER, {
+    query: params.query,
+    scopes: params.scopes,
+    types: params.types,
+    limit: params.limit,
+    vectorWeight: params.vectorWeight,
+    lexicalWeight: params.lexicalWeight,
+    graphWeight: params.graphWeight,
+    graphDepth: params.graphDepth,
+  });
+  return jsonResponse(200, {
+    query: params.query,
+    count: output.results.length,
+    results: output.results.map(summarizeSearchResult),
+    warnings: output.warnings,
+    vector_retrieval_used: output.vectorRetrievalUsed,
   });
 }
 
@@ -783,7 +914,7 @@ function makeHandler(ctx: WebContext): (req: IncomingMessage, res: ServerRespons
             return;
           }
         }
-        const apiResponse = route({ method, rawUrl, authorization: req.headers.authorization }, ctx);
+        const apiResponse = await routeAsync({ method, rawUrl, authorization: req.headers.authorization }, ctx);
         if (apiResponse !== null && apiResponse !== undefined) {
           sendResponse(res, apiResponse);
           return;

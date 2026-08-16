@@ -22,11 +22,14 @@ import {
   insertRelation,
   upsertVector,
 } from '../db/queries.js';
+import type { Embedder } from '../engine/embedding.js';
 import {
   route,
+  routeAsync,
   resolveStaticFile,
   resolveSpaFallback,
   runWebServer,
+  type RouteRequest,
   type WebContext,
   type WebResponse,
 } from './server.js';
@@ -44,6 +47,13 @@ afterAll(() => {
   db.close();
 });
 
+/** route() may return null (the static-fallback signal); API tests always expect a response. */
+function mustRoute(req: RouteRequest, context: WebContext = ctx): WebResponse {
+  const res = route(req, context);
+  if (res === null) throw new Error(`route() unexpectedly returned null for ${req.method} ${req.rawUrl}`);
+  return res;
+}
+
 beforeEach(() => {
   // Wipe entities / relations / candidates / vectors between tests for isolation.
   db.exec('DELETE FROM relations; DELETE FROM entity_vectors; DELETE FROM memory_candidates; DELETE FROM entities;');
@@ -55,29 +65,28 @@ function jsonBody(res: WebResponse): { status: number; body: Record<string, unkn
 
 describe('route — health and 404s', () => {
   it('GET /api/health returns ok', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/health' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/health' }, ctx);
     expect(res.status).toBe(200);
     expect(JSON.parse(res.body)).toMatchObject({ ok: true });
     expect(res.headers['content-type']).toContain('application/json');
   });
 
   it('GET /healthz (alias) returns ok', () => {
-    const res = route({ method: 'GET', rawUrl: '/healthz' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/healthz' }, ctx);
     expect(res.status).toBe(200);
   });
 
   it('unknown /api/* path returns 404', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/unknown' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/unknown' }, ctx);
     expect(res.status).toBe(404);
     expect(jsonBody(res).body['error']).toContain('unknown api endpoint');
   });
 
   it('non-/api path returns null (static fallback signal)', () => {
-    // The route() function returns null for non-API paths so the HTTP shell
-    // can attempt static serving. route()'s declared type is WebResponse but
-    // null is the documented signal — cast via `unknown` to assert the runtime
-    // contract without a separate overload.
-    const res = route({ method: 'GET', rawUrl: '/some/static/path' }, ctx) as unknown;
+    // route() returns null for non-API paths so the HTTP shell can attempt
+    // static serving. The declared type is `WebResponse | null`, so the null
+    // arm is directly assertable — no cast gymnastics needed.
+    const res = route({ method: 'GET', rawUrl: '/some/static/path' }, ctx);
     expect(res).toBeNull();
   });
 });
@@ -87,7 +96,7 @@ describe('route — stats', () => {
     insertEntity(db, { id: 'a', type: 'memory_entry', scopePath: 'proj:x', name: 'a' });
     insertEntity(db, { id: 'b', type: 'file', scopePath: 'proj:y', name: 'b' });
     insertRelation(db, { sourceId: 'a', targetId: 'b', relation: 'ANCHORED_TO' });
-    const res = route({ method: 'GET', rawUrl: '/api/stats' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/stats' }, ctx);
     expect(res.status).toBe(200);
     const body = jsonBody(res).body;
     expect(body['entities']).toBe(2);
@@ -128,13 +137,13 @@ describe('route — memory list / get / delete', () => {
   });
 
   it('falls back to the default limit when the value is non-positive', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?limit=-5' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?limit=-5' }, ctx);
     const memories = jsonBody(res).body['memories'] as unknown[];
     expect(memories).toHaveLength(2);
   });
 
   it('falls back to the default limit when the value is not a finite number', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?limit=abc' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?limit=abc' }, ctx);
     const memories = jsonBody(res).body['memories'] as unknown[];
     expect(memories).toHaveLength(2);
   });
@@ -148,11 +157,11 @@ describe('route — memory list / get / delete', () => {
       content: 'truncation test',
     });
     insertRelation(db, { sourceId: 'long', targetId: 'f1', relation: 'ANCHORED_TO' });
-    const listRes = route({ method: 'GET', rawUrl: '/api/memory?q=truncation' }, ctx);
+    const listRes = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=truncation' }, ctx);
     const listBody = jsonBody(listRes).body['memories'] as Array<{ id: string; name: string }>;
     expect(listBody[0]?.['name'].length).toBeGreaterThan(60);
 
-    const graphRes = route({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
+    const graphRes = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
     const nodes = jsonBody(graphRes).body['nodes'] as Array<{ id: string; label: string }>;
     const longNode = nodes.find((n) => n.id === 'long');
     expect(longNode?.['label']).toContain('…');
@@ -167,7 +176,7 @@ describe('route — memory list / get / delete', () => {
       name: 'this is a very long file name that exceeds sixty characters by quite a lot actually yes',
     });
     insertRelation(db, { sourceId: 'm1', targetId: 'f2', relation: 'ANCHORED_TO' });
-    const graphRes = route({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
+    const graphRes = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
     const nodes = jsonBody(graphRes).body['nodes'] as Array<{ id: string; label: string }>;
     const f2 = nodes.find((n) => n.id === 'f2');
     expect(f2?.['label']).toContain('…');
@@ -175,7 +184,7 @@ describe('route — memory list / get / delete', () => {
   });
 
   it('filters out FTS hits whose entity is not a memory_entry', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?q=auth' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=auth' }, ctx);
     const memories = jsonBody(res).body['memories'] as Array<{ id: string; type?: string }>;
     expect(memories.map((m) => m.id).sort()).toEqual(['m1']);
   });
@@ -186,7 +195,7 @@ describe('route — memory list / get / delete', () => {
     // assert is the invariant: exactly one node remains, and the edge that
     // touched the trimmed memory is filtered.
     insertRelation(db, { sourceId: 'm1', targetId: 'm2', relation: 'SUPERSEDES' });
-    const graphRes = route({ method: 'GET', rawUrl: '/api/graph/memory?limit=1' }, ctx);
+    const graphRes = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory?limit=1' }, ctx);
     const body = jsonBody(graphRes).body;
     const nodes = body['nodes'] as Array<{ id: string }>;
     const edges = body['edges'] as Array<{ source: string; target: string }>;
@@ -196,7 +205,7 @@ describe('route — memory list / get / delete', () => {
   });
 
   it('GET /api/memory lists every memory_entry', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory' }, ctx);
     expect(res.status).toBe(200);
     const body = jsonBody(res).body;
     expect(body['count']).toBe(2);
@@ -206,32 +215,32 @@ describe('route — memory list / get / delete', () => {
   });
 
   it('GET /api/memory respects scope filter', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?scope=proj:app/file:src/auth.ts' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?scope=proj:app/file:src/auth.ts' }, ctx);
     const memories = jsonBody(res).body['memories'] as Array<{ id: string }>;
     expect(memories).toHaveLength(1);
     expect(memories[0]?.['id']).toBe('m1');
   });
 
   it('GET /api/memory respects limit', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?limit=1' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?limit=1' }, ctx);
     const memories = jsonBody(res).body['memories'] as unknown[];
     expect(memories).toHaveLength(1);
   });
 
   it('GET /api/memory?q= runs FTS5 and filters by type', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?q=token' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=token' }, ctx);
     const memories = jsonBody(res).body['memories'] as Array<{ id: string }>;
     expect(memories.map((m) => m.id)).toEqual(['m1']);
   });
 
   it('GET /api/memory?q= returns empty array when nothing matches', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory?q=zzznonexistent' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=zzznonexistent' }, ctx);
     expect(jsonBody(res).body['count']).toBe(0);
   });
 
   it('GET /api/memory/:id returns the memory with graph paths', () => {
     insertRelation(db, { sourceId: 'm1', targetId: 'f1', relation: 'ANCHORED_TO' });
-    const res = route({ method: 'GET', rawUrl: '/api/memory/m1' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory/m1' }, ctx);
     expect(res.status).toBe(200);
     const body = jsonBody(res).body;
     expect(body['id']).toBe('m1');
@@ -240,46 +249,46 @@ describe('route — memory list / get / delete', () => {
   });
 
   it('GET /api/memory/:id returns 404 for unknown id', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory/missing' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory/missing' }, ctx);
     expect(res.status).toBe(404);
   });
 
   it('GET /api/memory/:id returns 400 for a non-memory entity', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory/f1' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory/f1' }, ctx);
     expect(res.status).toBe(400);
   });
 
   it('GET /api/memory/:id returns 400 for malformed id', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/memory/..%2F..%2Fetc' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory/..%2F..%2Fetc' }, ctx);
     expect(res.status).toBe(400);
   });
 
   it('DELETE /api/memory/:id removes the memory + cascades', () => {
     insertRelation(db, { sourceId: 'm1', targetId: 'f1', relation: 'ANCHORED_TO' });
     upsertVector(db, 'm1', new Float32Array([1, 0, 0]));
-    const before = route({ method: 'GET', rawUrl: '/api/stats' }, ctx);
+    const before = mustRoute({ method: 'GET', rawUrl: '/api/stats' }, ctx);
     expect(jsonBody(before).body['entities']).toBe(3);
-    const res = route({ method: 'DELETE', rawUrl: '/api/memory/m1' }, ctx);
+    const res = mustRoute({ method: 'DELETE', rawUrl: '/api/memory/m1' }, ctx);
     expect(res.status).toBe(200);
     expect(jsonBody(res).body['deleted']).toBe(true);
-    const after = route({ method: 'GET', rawUrl: '/api/stats' }, ctx);
+    const after = mustRoute({ method: 'GET', rawUrl: '/api/stats' }, ctx);
     expect(jsonBody(after).body['entities']).toBe(2);
     expect(jsonBody(after).body['relations']).toBe(0);
     expect(jsonBody(after).body['vectors']).toBe(0);
   });
 
   it('DELETE /api/memory/:id returns 404 for unknown id', () => {
-    const res = route({ method: 'DELETE', rawUrl: '/api/memory/missing' }, ctx);
+    const res = mustRoute({ method: 'DELETE', rawUrl: '/api/memory/missing' }, ctx);
     expect(res.status).toBe(404);
   });
 
   it('DELETE /api/memory/:id returns 400 for non-memory entity', () => {
-    const res = route({ method: 'DELETE', rawUrl: '/api/memory/f1' }, ctx);
+    const res = mustRoute({ method: 'DELETE', rawUrl: '/api/memory/f1' }, ctx);
     expect(res.status).toBe(400);
   });
 
   it('DELETE /api/memory/:id returns 400 for malformed id', () => {
-    const res = route({ method: 'DELETE', rawUrl: '/api/memory/!!!bad!!!' }, ctx);
+    const res = mustRoute({ method: 'DELETE', rawUrl: '/api/memory/!!!bad!!!' }, ctx);
     expect(res.status).toBe(400);
   });
 });
@@ -297,12 +306,12 @@ describe('route — auth-token gating', () => {
   });
 
   it('DELETE is 401 without an Authorization header', () => {
-    const res = route({ method: 'DELETE', rawUrl: '/api/memory/m1' }, authCtx);
+    const res = mustRoute({ method: 'DELETE', rawUrl: '/api/memory/m1' }, authCtx);
     expect(res.status).toBe(401);
   });
 
   it('DELETE is 401 with the wrong token (same length, constant-time path)', () => {
-    const res = route(
+    const res = mustRoute(
       { method: 'DELETE', rawUrl: '/api/memory/m1', authorization: bearer(WRONG_SAME_LENGTH) },
       authCtx,
     );
@@ -310,7 +319,7 @@ describe('route — auth-token gating', () => {
   });
 
   it('DELETE is 401 with a wrong-length bearer token', () => {
-    const res = route(
+    const res = mustRoute(
       { method: 'DELETE', rawUrl: '/api/memory/m1', authorization: bearer('short') },
       authCtx,
     );
@@ -319,7 +328,7 @@ describe('route — auth-token gating', () => {
 
   it('DELETE succeeds with the correct bearer token', () => {
     insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:demo', name: 'm1' });
-    const res = route(
+    const res = mustRoute(
       { method: 'DELETE', rawUrl: '/api/memory/m1', authorization: bearer(TOKEN) },
       authCtx,
     );
@@ -329,7 +338,7 @@ describe('route — auth-token gating', () => {
 
   it('DELETE succeeds with the correct raw (non-bearer) token', () => {
     insertEntity(db, { id: 'm2', type: 'memory_entry', scopePath: 'proj:demo/file:src/x.ts', name: 'm2' });
-    const res = route(
+    const res = mustRoute(
       { method: 'DELETE', rawUrl: '/api/memory/m2', authorization: TOKEN },
       authCtx,
     );
@@ -338,7 +347,7 @@ describe('route — auth-token gating', () => {
 
   it('read-only GET is not gated when a token is configured', () => {
     insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:demo', name: 'm1' });
-    const res = route({ method: 'GET', rawUrl: '/api/memory/m1' }, authCtx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory/m1' }, authCtx);
     expect(res.status).toBe(200);
   });
 });
@@ -350,24 +359,24 @@ describe('route — candidates', () => {
   });
 
   it('lists all candidates by default', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/candidates' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/candidates' }, ctx);
     expect(res.status).toBe(200);
     expect(jsonBody(res).body['count']).toBe(2);
   });
 
   it('filters by status', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/candidates?status=pending' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/candidates?status=pending' }, ctx);
     expect(res.status).toBe(200);
     expect(jsonBody(res).body['count']).toBe(2);
   });
 
   it('ignores an unknown status (returns all)', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/candidates?status=bogus' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/candidates?status=bogus' }, ctx);
     expect(jsonBody(res).body['count']).toBe(2);
   });
 
   it('respects limit', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/candidates?limit=1' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/candidates?limit=1' }, ctx);
     const list = jsonBody(res).body['candidates'] as unknown[];
     expect(list).toHaveLength(1);
   });
@@ -391,7 +400,7 @@ describe('route — memory graph', () => {
   });
 
   it('returns every memory_entry plus edges that touch them', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
     const body = jsonBody(res).body;
     const nodes = body['nodes'] as Array<{ id: string; type: string }>;
     const edges = body['edges'] as Array<{ source: string; target: string; relation: string }>;
@@ -405,20 +414,20 @@ describe('route — memory graph', () => {
 
   it('returns empty arrays when there are no memories', () => {
     db.exec('DELETE FROM relations; DELETE FROM entity_vectors; DELETE FROM memory_candidates; DELETE FROM entities;');
-    const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
     const body = jsonBody(res).body;
     expect(body['nodes']).toEqual([]);
     expect(body['edges']).toEqual([]);
   });
 
   it('respects limit', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/graph/memory?limit=1' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory?limit=1' }, ctx);
     const body = jsonBody(res).body;
     expect((body['nodes'] as unknown[]).length).toBe(1);
   });
 
   it('emits no position when layoutSeed is absent (back-compat)', () => {
-    const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
     const nodes = jsonBody(res).body['nodes'] as Array<{ id: string; position?: unknown }>;
     expect(nodes.length).toBeGreaterThan(0);
     for (const n of nodes) expect(n.position).toBeUndefined();
@@ -428,7 +437,7 @@ describe('route — memory graph', () => {
     const seededCtx = { ...ctx, layoutSeed: 7 };
     type P = { x: number; y: number };
     const call = (c: typeof seededCtx): Array<{ id: string; position?: P }> =>
-      (jsonBody(route({ method: 'GET', rawUrl: '/api/graph/memory' }, c)).body['nodes'] as Array<{
+      (jsonBody(mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, c)).body['nodes'] as Array<{
         id: string;
         position?: P;
       }>).map((n) => ({ id: n.id, position: n.position }));
@@ -475,7 +484,7 @@ describe('route — memory graph', () => {
     // arm of the content-identity sort comparator (scope_path tie-break).
     insertEntity(db, { id: 'c', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'alpha', confidence: 0.9 });
     const seededCtx = { ...ctx, layoutSeed: 7 };
-    const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, seededCtx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory' }, seededCtx);
     const nodes = jsonBody(res).body['nodes'] as Array<{ id: string; position?: { x: number; y: number } }>;
     expect(nodes).toHaveLength(5);
     const coords = nodes.map((n) => `${n.position?.x}:${n.position?.y}`);
@@ -501,7 +510,7 @@ describe('route — memory graph', () => {
         stmt.run(`mem-${i}`, `proj:bulk/file:${i}.ts`, `memory ${i}`);
       }
     });
-    const res = route({ method: 'GET', rawUrl: '/api/graph/memory?limit=2000' }, ctx);
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/graph/memory?limit=2000' }, ctx);
     expect(res.status).toBe(200);
     const body = jsonBody(res).body;
     expect((body['nodes'] as unknown[]).length).toBe(750);
@@ -835,5 +844,211 @@ describe('OS-agnostic imports', () => {
     const p = join(tmpdir(), 'synapse-web-test');
     expect(typeof p).toBe('string');
     expect(p.length).toBeGreaterThan(0);
+  });
+});
+
+describe('route — memory list q + scope interplay', () => {
+  beforeEach(() => {
+    insertEntity(db, {
+      id: 'mq1',
+      type: 'memory_entry',
+      scopePath: 'proj:app/file:src/auth.ts',
+      name: 'token decision',
+      content: 'token content here',
+    });
+    insertEntity(db, {
+      id: 'mq2',
+      type: 'memory_entry',
+      scopePath: 'proj:app/file:src/payments.ts',
+      name: 'token payments',
+      content: 'token in payments too',
+    });
+  });
+
+  it('applies the scope filter alongside q (regression: q used to ignore scope)', () => {
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=token&scope=proj:app/file:src/payments.ts' }, ctx);
+    const memories = jsonBody(res).body['memories'] as Array<{ id: string }>;
+    expect(memories.map((m) => m.id)).toEqual(['mq2']);
+  });
+
+  it('returns empty when the scope excludes every FTS hit', () => {
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=token&scope=proj:other' }, ctx);
+    expect(jsonBody(res).body['count']).toBe(0);
+  });
+
+  it('treats an empty scope= value as no scope filter', () => {
+    const res = mustRoute({ method: 'GET', rawUrl: '/api/memory?q=token&scope=' }, ctx);
+    const memories = jsonBody(res).body['memories'] as Array<{ id: string }>;
+    expect(memories.map((m) => m.id).sort()).toEqual(['mq1', 'mq2']);
+  });
+});
+
+describe('routeAsync — GET /api/search', () => {
+  // Deterministic 2-d embedder: the query always embeds to [1, 0], so the
+  // entity stored with [1, 0] is the perfect semantic match and the one
+  // stored with [0, 1] is orthogonal (score 0, still ranked).
+  const stubEmbedder: Embedder = {
+    modelId: 'stub-model',
+    dimension: 2,
+    isReady: () => true,
+    init: async () => undefined,
+    embed: async () => new Float32Array([1, 0]),
+    embedBatch: async (texts) => texts.map(() => new Float32Array([1, 0])),
+  };
+  let searchCtx: WebContext;
+
+  beforeEach(() => {
+    insertEntity(db, {
+      id: 's1',
+      type: 'memory_entry',
+      scopePath: 'proj:app/file:src/auth.ts',
+      name: 'token caching decision',
+      content: 'AuthService caches tokens for 5 minutes',
+    });
+    insertEntity(db, {
+      id: 's2',
+      type: 'memory_entry',
+      scopePath: 'proj:app/file:src/payments.ts',
+      name: 'payment retry',
+      content: 'PaymentsService retries failed charges 3x',
+    });
+    upsertVector(db, 's1', new Float32Array([1, 0]));
+    upsertVector(db, 's2', new Float32Array([0, 1]));
+    insertRelation(db, { sourceId: 's1', targetId: 's2', relation: 'RELATED_TO' });
+    searchCtx = { db, embedder: stubEmbedder };
+  });
+
+  interface SearchBody {
+    query: string;
+    count: number;
+    results: Array<{
+      score: number;
+      ranks: { fts: number | null; vector: number | null; graph: number | null };
+      matched_scopes: string[];
+      entity: { id: string; type: string; scope_path: string; name: string; content: string | null };
+      graph_paths: Array<{ relation: string; source: string; target: string }>;
+    }>;
+    warnings: string[];
+    vector_retrieval_used: boolean;
+  }
+
+  it('returns 400 when q is missing or blank', async () => {
+    const missing = await routeAsync({ method: 'GET', rawUrl: '/api/search' }, searchCtx);
+    expect(missing!.status).toBe(400);
+    expect(JSON.parse(missing!.body)['error']).toContain('q');
+    const blank = await routeAsync({ method: 'GET', rawUrl: '/api/search?q=%20%20' }, searchCtx);
+    expect(blank!.status).toBe(400);
+  });
+
+  it('returns scored results with per-channel ranks, sorted by fused score', async () => {
+    const res = await routeAsync({ method: 'GET', rawUrl: '/api/search?q=token%20caching' }, searchCtx);
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['query']).toBe('token caching');
+    expect(body['count']).toBeGreaterThan(0);
+    expect(body['vector_retrieval_used']).toBe(true);
+    expect(body['warnings']).toEqual([]);
+    const top = body['results'][0]!;
+    expect(top.entity.id).toBe('s1');
+    expect(top.ranks.fts).toBe(1);
+    expect(top.ranks.vector).toBe(1);
+    expect(top.entity.type).toBe('memory_entry');
+    expect(top.entity.scope_path).toBe('proj:app/file:src/auth.ts');
+    // Fused scores must come back in descending order.
+    for (let i = 1; i < body['results'].length; i += 1) {
+      expect(body['results'][i]!.score).toBeLessThanOrEqual(body['results'][i - 1]!.score);
+    }
+    // The RELATED_TO edge ships in the compact graph-path form.
+    expect(top.graph_paths.some((p) => p.relation === 'RELATED_TO')).toBe(true);
+  });
+
+  it('restricts results to the requested scope prefix', async () => {
+    const res = await routeAsync(
+      { method: 'GET', rawUrl: '/api/search?q=token&scope=proj:app/file:src/payments.ts' },
+      searchCtx,
+    );
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['results'].map((r) => r.entity.id)).toEqual(['s2']);
+  });
+
+  it('filters by entity type via repeated type= params', async () => {
+    const res = await routeAsync(
+      { method: 'GET', rawUrl: '/api/search?q=token&type=memory_entry&type=file' },
+      searchCtx,
+    );
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['results'].every((r) => r.entity.type === 'memory_entry' || r.entity.type === 'file')).toBe(true);
+  });
+
+  it('degrades to lexical+graph with a warning when the context has no embedder', async () => {
+    // s3 has no content (projection must carry content: null); s4 has content
+    // past the 500-char projection cap (must come back truncated with an
+    // ellipsis, never the full payload).
+    insertEntity(db, {
+      id: 's3',
+      type: 'memory_entry',
+      scopePath: 'proj:app/file:src/auth.ts',
+      name: 'token bare note',
+    });
+    insertEntity(db, {
+      id: 's4',
+      type: 'memory_entry',
+      scopePath: 'proj:app/file:src/auth.ts',
+      name: 'token verbose note',
+      content: `${'token detail '.repeat(60)}`,
+    });
+    const res = await routeAsync({ method: 'GET', rawUrl: '/api/search?q=token' }, ctx);
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['vector_retrieval_used']).toBe(false);
+    expect(body['warnings'].some((w) => w.includes('embedder not configured'))).toBe(true);
+    expect(body['results'].some((r) => r.entity.id === 's1')).toBe(true);
+    const bare = body['results'].find((r) => r.entity.id === 's3');
+    expect(bare?.entity.content).toBeNull();
+    const verbose = body['results'].find((r) => r.entity.id === 's4');
+    expect(verbose?.entity.content?.length).toBe(500);
+    expect(verbose?.entity.content?.endsWith('…')).toBe(true);
+  });
+
+  it('surfaces a warning when the embedder fails mid-init', async () => {
+    const failing: Embedder = {
+      ...stubEmbedder,
+      init: () => Promise.reject(new Error('model missing')),
+    };
+    const res = await routeAsync({ method: 'GET', rawUrl: '/api/search?q=token' }, { db, embedder: failing });
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['vector_retrieval_used']).toBe(false);
+    expect(body['warnings'].some((w) => w.includes('semantic retrieval skipped: model missing'))).toBe(true);
+  });
+
+  it('falls back to sane defaults for invalid limit/weight/depth params', async () => {
+    // lexical_weight=2 is valid (covers the clamp-to-max arm), scope= is an
+    // empty value that must be dropped by the list filter.
+    const res = await routeAsync(
+      { method: 'GET', rawUrl: '/api/search?q=token&limit=abc&vector_weight=oops&lexical_weight=2&graph_depth=99&scope=' },
+      searchCtx,
+    );
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['count']).toBeGreaterThan(0);
+  });
+
+  it('clamps the result limit to 50', async () => {
+    const res = await routeAsync({ method: 'GET', rawUrl: '/api/search?q=token&limit=500' }, searchCtx);
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as SearchBody;
+    expect(body['results'].length).toBeLessThanOrEqual(50);
+  });
+
+  it('delegates non-search paths to route() (health, 404, static-null)', async () => {
+    const health = await routeAsync({ method: 'GET', rawUrl: '/api/health' }, searchCtx);
+    expect(health!.status).toBe(200);
+    const missing = await routeAsync({ method: 'GET', rawUrl: '/api/nope' }, searchCtx);
+    expect(missing!.status).toBe(404);
+    const spa = await routeAsync({ method: 'GET', rawUrl: '/some/static/path' }, searchCtx);
+    expect(spa).toBeNull();
   });
 });
