@@ -99,11 +99,7 @@ export function buildScope(segments: readonly ScopeSegment[]): string {
     if (seg.value.length === 0) {
       throw new TypeError(`scope segment ${seg.kind} has an empty value`);
     }
-    if (out.length === 0) {
-      out.push(`${seg.kind}:${seg.value}`);
-    } else {
-      out.push(`${seg.kind}:${seg.value}`);
-    }
+    out.push(`${seg.kind}:${seg.value}`);
   }
   return out.join('/');
 }

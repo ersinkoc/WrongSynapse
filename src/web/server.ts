@@ -34,6 +34,7 @@ import {
   type GraphPathEdge,
 } from '../db/queries.js';
 import type { SynapseDatabase } from '../db/connection.js';
+import { SERVER_VERSION } from '../mcp/server.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -248,7 +249,7 @@ function buildMemoryGraph(db: SynapseDatabase, limit: number): MemoryGraph {
   // Chunk the in-list so we never exceed it on large memory sets.
   const placeholders = (n: number): string => new Array(n).fill('?').join(', ');
   const idList = [...memoryIds];
-  const chunkSize = 500;
+  const chunkSize = 400;
   const edgeRows: Record<string, unknown>[] = [];
   for (let i = 0; i < idList.length; i += chunkSize) {
     const chunk = idList.slice(i, i + chunkSize);
@@ -365,7 +366,7 @@ export function route(req: RouteRequest, ctx: WebContext): WebResponse {
 
   // Health probe (always available, no DB access required)
   if (method === 'GET' && (path === '/api/health' || path === '/healthz')) {
-    return jsonResponse(200, { ok: true, version: '0.1.0' });
+    return jsonResponse(200, { ok: true, version: SERVER_VERSION });
   }
 
   if (path === '/api/stats' && method === 'GET') {

@@ -11,7 +11,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import { Badge, Box, Card, Flex, Spinner, Text } from '@radix-ui/themes';
 
-import { api, type MemoryGraph as MemoryGraphData } from '../api.ts';
+import { api, type MemoryGraph as MemoryGraphData } from '../api';
 
 /**
  * Memory graph — the third tab. React Flow visualization of every memory
@@ -20,7 +20,7 @@ import { api, type MemoryGraph as MemoryGraphData } from '../api.ts';
  * Layout: dagre-style positioning computed once on load (cheap O(N log N);
  * fine for the 500-cap). Pan + zoom controls are the React Flow defaults.
  */
-export default function MemoryGraph(): JSX.Element {
+export default function MemoryGraph() {
   return (
     <ReactFlowProvider>
       <MemoryGraphInner />
@@ -28,7 +28,7 @@ export default function MemoryGraph(): JSX.Element {
   );
 }
 
-function MemoryGraphInner(): JSX.Element {
+function MemoryGraphInner() {
   const [data, setData] = useState<MemoryGraphData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -123,7 +123,7 @@ function layoutGraph(data: MemoryGraphData): { nodes: Node[]; edges: Edge[] } {
 
 const NODE_TYPES = { memory: MemoryNode, neighbor: NeighborNode };
 
-function MemoryNode(props: NodeProps): JSX.Element {
+function MemoryNode(props: NodeProps) {
   const data = props.data as MemoryGraphData['nodes'][number];
   return (
     <Box
@@ -156,7 +156,7 @@ function MemoryNode(props: NodeProps): JSX.Element {
   );
 }
 
-function NeighborNode(props: NodeProps): JSX.Element {
+function NeighborNode(props: NodeProps) {
   const data = props.data as MemoryGraphData['nodes'][number];
   return (
     <Box

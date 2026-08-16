@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Box, Card, Flex, Grid, Heading, Text, Spinner, Badge } from '@radix-ui/themes';
 
-import { api, type Stats as StatsData } from '../api.ts';
+import { api, type Stats as StatsData } from '../api';
 
 /**
  * Statistics panel — the first tab. Shows the four core counts (entities,
@@ -9,7 +9,7 @@ import { api, type Stats as StatsData } from '../api.ts';
  * of entity types + relation types. Each stat card uses tabular-nums via
  * .font-mono so the digits align when stacked.
  */
-export default function Stats(): JSX.Element {
+export default function Stats() {
   const [stats, setStats] = useState<StatsData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -81,7 +81,7 @@ function BreakdownCard(props: {
   title: string;
   entries: Record<string, number>;
   accent: 'cyan' | 'green';
-}): JSX.Element {
+}) {
   const rows = Object.entries(props.entries).sort(([, a], [, b]) => b - a);
   return (
     <Card size="2">

@@ -6,7 +6,6 @@ import {
   Card,
   Dialog,
   Flex,
-  Heading,
   IconButton,
   ScrollArea,
   Spinner,
@@ -16,7 +15,7 @@ import {
 } from '@radix-ui/themes';
 import { MagnifyingGlassIcon, TrashIcon } from '@radix-ui/react-icons';
 
-import { api, type MemorySummary, type MemoryDetail } from '../api.ts';
+import { api, type MemorySummary, type MemoryDetail } from '../api';
 
 /**
  * Memory list + detail + remove — the second tab.
@@ -26,7 +25,7 @@ import { api, type MemorySummary, type MemoryDetail } from '../api.ts';
  * selected memory's metadata + graph paths. Delete is a confirmation dialog
  * (Radix Dialog handles focus trapping + escape).
  */
-export default function MemoryList(): JSX.Element {
+export default function MemoryList() {
   const [memories, setMemories] = useState<MemorySummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MemoryDetail | null>(null);
@@ -173,7 +172,7 @@ function MemoryRow(props: {
   selected: boolean;
   onSelect: () => void;
   onDeleted: () => void;
-}): JSX.Element {
+}) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -262,7 +261,7 @@ function MemoryRow(props: {
   );
 }
 
-function MemoryDetailPanel(props: { detail: MemoryDetail; onDeleted: () => void }): JSX.Element {
+function MemoryDetailPanel(props: { detail: MemoryDetail; onDeleted: () => void }) {
   const [busy, setBusy] = useState(false);
   return (
     <Flex direction="column" gap="3">

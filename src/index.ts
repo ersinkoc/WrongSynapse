@@ -15,7 +15,6 @@
  */
 
 import { realpathSync } from 'node:fs';
-import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -225,7 +224,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (shouldStartWeb(cli)) {
     const webPort = resolveWebPort(cli) ?? 0;
     const spaDir = resolveSpaStaticDir(import.meta.url, dirname(fileURLToPath(import.meta.url)));
-    web = await runWebServer({ db, staticDir: existsSync(spaDir) ? spaDir : undefined }, webPort);
+    web = await runWebServer({ db, staticDir: spaDir }, webPort);
     if (web.port > 0) {
       console.error(`WrongSynapse admin web UI listening on ${web.url}`);
       if (shouldAutoOpenBrowser(cli)) {

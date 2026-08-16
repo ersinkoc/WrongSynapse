@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Box, Container, Flex, Heading, Tabs, Text, Badge, Spinner } from '@radix-ui/themes';
 
-import Stats from './components/Stats.tsx';
-import MemoryList from './components/MemoryList.tsx';
-import MemoryGraph from './components/MemoryGraph.tsx';
-import { api } from './api.ts';
+import Stats from './components/Stats';
+import MemoryList from './components/MemoryList';
+import MemoryGraph from './components/MemoryGraph';
+import { api } from './api';
 
 /**
  * Single-page admin shell.
@@ -13,7 +13,7 @@ import { api } from './api.ts';
  * user requested. The header carries the server version + health badge so an
  * operator can confirm the SPA is talking to a live backend at a glance.
  */
-export default function App(): JSX.Element {
+export default function App() {
   const [health, setHealth] = useState<{ ok: boolean; version: string } | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
 
