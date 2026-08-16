@@ -26,6 +26,78 @@ The three channels are fused with **Reciprocal Rank Fusion (RRF, k = 60)** into 
 | **Disk** | ≈ 25 MB for the embedding model (q8 ONNX, one-time download), then offline |
 | **git** | optional — only for `--git` history linking |
 
+## Optional admin web UI
+
+When `wrongsynapse` starts, it also boots a single-page admin panel on a
+kernel-assigned local port (different on every startup). The UI is built
+with React 19 + Tailwind CSS v4 + Radix UI Themes 3 + React Flow 12,
+uses a dark-pro design palette, and lives entirely in the same Node
+process as the MCP server — no second port, no second process.
+
+Three tabs cover the surface the MCP tools expose:
+
+| Tab | What it shows |
+|---|---|
+| **Statistics** | Entity / relation / vector / candidate / FTS-row counts, plus a per-type breakdown of entities and relations |
+| **Memory** | Searchable list of every `memory_entry` (filter by scope or free-text); click a row for the full detail panel (scope, name, content, metadata, anchored-to graph paths, confidence, updated timestamp); remove with a confirmation dialog |
+| **Graph** | React Flow visualisation: every `memory_entry` plus the non-memory endpoints of every relation that touches one. Pan, zoom, fit-to-view. |
+
+The UI is opt-out, not opt-in — it boots by default. Disable it with
+`--no-web` or `SYNAPSE_WEB=0`. Bind to a specific port with
+`--web-port <n>` or `SYNAPSE_WEB_PORT=<n>` (default: kernel-assigned free
+port, so every startup uses a different port). Auto-open the browser
+with `--web-open` or `SYNAPSE_WEB_OPEN=1` (best-effort; silently no-ops
+on hosts without a default browser).
+
+```bash
+# Default behaviour — MCP + admin UI
+wrongsynapse
+# WrongSynapse admin web UI listening on http://127.0.0.1:50935
+
+# Disable the web UI
+wrongsynapse --no-web
+
+# Pin the web UI to a specific port
+wrongsynapse --web-port 9090
+# WrongSynapse admin web UI listening on http://127.0.0.1:9090
+```
+
+The web server binds to `127.0.0.1` only and **never governs process
+lifetime** (`httpServer.unref()`); a web-bind failure logs a warning and
+the MCP server continues unaffected. Destructive operations (DELETE
+`/api/memory/:id`) require an `Authorization: Bearer <token>` header
+where the token is a random hex string printed next to the listen URL at
+boot — read-only endpoints (stats, list, graph) are open.
+
+The SPA is built separately from the Node bundle so the published npm
+package stays lean. From a checkout:
+
+```bash
+npm run web:build      # one-shot: install web deps, typecheck, vite build → web/dist/
+npm run web:dev        # dev server on :5173 with /api proxying to localhost:8765
+npm run web:typecheck  # tsc -b --noEmit on the SPA only
+```
+
+`npm run web:install` runs `npm --prefix web install` for CI to pre-populate
+`web/node_modules/` before the build step. The build artifact (`web/dist/`)
+is git-ignored; the npm-published tarball contains only `dist/` (the Node
+server bundle).
+
+The web server's REST surface (used by the SPA and by anyone scripting
+against the admin panel):
+
+| Method | Path | Returns |
+|---|---|---|
+| `GET` | `/api/health` | `{ ok, version }` |
+| `GET` | `/api/stats` | counts + type/relation breakdowns |
+| `GET` | `/api/memory?scope=…&q=…&limit=…` | `{ count, memories[] }` |
+| `GET` | `/api/memory/:id` | one memory + its anchored graph paths |
+| `DELETE` | `/api/memory/:id` | `{ id, deleted: true }` (Bearer auth required) |
+| `GET` | `/api/candidates?status=…&limit=…` | `{ count, candidates[] }` |
+| `GET` | `/api/graph/memory?limit=…` | `{ nodes[], edges[] }` (React Flow shape) |
+
+---
+
 ## Quickstart
 
 ```bash

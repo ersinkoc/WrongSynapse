@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Optional admin web UI** — a single-page admin panel for inspecting and
+  pruning the memory database without going through the MCP tools. Built
+  with React 19 + Tailwind CSS v4 + Radix UI Themes 3 + React Flow 12,
+  served from the same Node process as the MCP server, and disabled by
+  default behind a flag.
+
+  - Three tabs:
+    - **Statistics** — counts (entities, relations, vectors, candidates,
+      FTS rows) plus type/relation breakdowns.
+    - **Memory** — searchable list of `memory_entry` rows with a detail
+      panel; remove action with confirmation dialog.
+    - **Graph** — React Flow visualisation of every `memory_entry` plus
+      the non-memory endpoints of every relation that touches one (file
+      neighbours, project anchors, etc.).
+  - Boots by default at `wrongsynapse` startup with no flag required;
+    disable with `--no-web` or `SYNAPSE_WEB=0`. The port is
+    kernel-assigned on every startup (different port each run); pin it
+    with `--web-port <n>` or `SYNAPSE_WEB_PORT=<n>`.
+  - Optional browser auto-open (`--web-open` / `SYNAPSE_WEB_OPEN=1`) —
+    best-effort, swallowed on hosts without a default browser (CI,
+    headless server). Never blocks the main app.
+  - Auth token gating for destructive operations (DELETE
+    `/api/memory/:id`). The server generates a random token at boot,
+    prints it next to the listen URL on stderr, and the SPA sends it
+    as `Authorization: Bearer <token>`. Read-only endpoints remain open.
+    Opt out by setting `ctx.authToken` to `undefined` (the CLI does not
+    currently do this; the token is always enabled).
+  - Built statically into `web/dist/` via `npm run web:build`. The
+    npm-published tarball contains `dist/` (server) only; the SPA is
+    built separately by anyone who wants the admin UI and served
+    automatically when `web/dist/` exists next to `dist/`.
+  - Main-app invariant preserved: the web server is unref'd and bound
+    in the background; a bind failure logs to stderr and does not stop
+    the MCP server (stdio or SSE) from running.
+
 ## [0.1.1] — 2026-08-16
 
 Patch release: ship the agent skill and the global-install cache fix that
