@@ -28,3 +28,11 @@ coverage/
 
 .dfmt/
 .claude/
+*-block.bin
+
+# optional admin web UI (React/Vite SPA)
+web/dist/
+web/node_modules/
+web/.vite/
+web/tsconfig.tsbuildinfo
+
