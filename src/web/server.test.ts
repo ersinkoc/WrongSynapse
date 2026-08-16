@@ -457,26 +457,29 @@ describe('route — memory graph', () => {
     expect(moved.length).toBeGreaterThan(0);
   });
 
-  it('collision retry: same-scope memories (identical PRNG streams) still land on distinct coords', () => {
+  it('collision retry: identical (scope,label) nodes still land on distinct coords — memory + neighbor loops', () => {
     db.exec('DELETE FROM relations; DELETE FROM entity_vectors; DELETE FROM memory_candidates; DELETE FROM entities;');
-    // Two memories sharing one scope: identical scope hash → identical rng
-    // stream → identical first proposal → the second one MUST retry outward.
-    insertEntity(db, { id: 'a', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'a', confidence: 0.9 });
-    insertEntity(db, { id: 'b', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'b', confidence: 0.9 });
+    // Identical (scope_path, label) pairs produce IDENTICAL PRNG streams:
+    // the first node claims the shared first proposal, the second MUST walk
+    // the retry branch in BOTH loops (non-memory nudge + memory polar band).
+    insertEntity(db, { id: 'a', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'twin', confidence: 0.9 });
+    insertEntity(db, { id: 'b', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'twin', confidence: 0.9 });
+    insertEntity(db, { id: 'fa', type: 'symbol', scopePath: 'proj:c/file:same.ts/sym:one', name: 'twin' });
+    insertEntity(db, { id: 'fb', type: 'symbol', scopePath: 'proj:c/file:same.ts/sym:two', name: 'twin' });
     const seededCtx = { ...ctx, layoutSeed: 7 };
     const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, seededCtx);
     const nodes = jsonBody(res).body['nodes'] as Array<{ id: string; position?: { x: number; y: number } }>;
-    expect(nodes).toHaveLength(2);
+    expect(nodes).toHaveLength(4);
+    const coords = nodes.map((n) => `${n.position?.x}:${n.position?.y}`);
+    expect(new Set(coords).size).toBe(4); // all four distinct — both retries fired
+    for (const n of nodes) expect(n.position).toBeDefined();
+    // The twins sharing an rng stream must differ (one retried outward).
     const pa = nodes.find((n) => n.id === 'a')?.position;
     const pb = nodes.find((n) => n.id === 'b')?.position;
-    expect(pa).toBeDefined();
-    expect(pb).toBeDefined();
     expect(`${pa?.x}:${pa?.y}`).not.toBe(`${pb?.x}:${pb?.y}`);
-    // The retried node sits one band further out (radius grew by exactly 60).
-    const anchor = { x: 0, y: 0 }; // anchorCenter('proj:c/file:same.ts') is unknown here; compare the two
-    const da = Math.hypot(pa?.x ?? 0 - anchor.x, pa?.y ?? 0 - anchor.y);
-    const db_ = Math.hypot(pb?.x ?? 0 - anchor.x, pb?.y ?? 0 - anchor.y);
-    expect(Math.abs(da - db_)).toBeGreaterThan(0);
+    const fa = nodes.find((n) => n.id === 'fa')?.position;
+    const fb = nodes.find((n) => n.id === 'fb')?.position;
+    expect(`${fa?.x}:${fa?.y}`).not.toBe(`${fb?.x}:${fb?.y}`);
   });
 
   it('handles large memory sets via SQLite placeholder chunking', () => {
