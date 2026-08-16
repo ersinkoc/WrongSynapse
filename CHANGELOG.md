@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] — 2026-08-16
+
+Patch release: tri-hybrid retrieval with scores lands in the admin web UI,
+and a hardening pass fixes real bugs across web auth, retrieval quality,
+tool contracts, and shutdown ordering.
+
+### Added
+
+- **Admin web UI: Search tab + `GET /api/search`** — the retrieval engine
+  behind the `synapse_hybrid_query` MCP tool, in the browser. The endpoint
+  runs full tri-hybrid retrieval (FTS5/BM25 + semantic embeddings + graph
+  expansion, fused with Reciprocal Rank Fusion, k = 60) and returns every
+  hit with its fused `score`, per-channel `ranks` (`fts` / `vector` /
+  `graph`, `null` when a channel did not rank the hit), the entity summary
+  (content projected to 500 chars), compact `graph_paths`, plus
+  `warnings` and `vector_retrieval_used` so the UI can explain degradation
+  (e.g. the embedding model not being cached). Query params mirror the MCP
+  tool 1:1 — `q` (required), `scope` (repeatable), `type` (repeatable),
+  `limit` (1–50, default 10), `vector_weight` / `lexical_weight` /
+  `graph_weight` (0–10, default 1), `graph_depth` (1–3, default 1); invalid
+  values fall back to defaults, a blank `q` is a 400. The new Search tab
+  (now the landing tab) exposes all of it: query bar, scope prefix, graph
+  depth, limit, and per-channel weight sliders; each result row shows the
+  score with a bar relative to the top hit, `FTS #n` / `VEC #n` /
+  `GRAPH —` rank chips, and a content preview. Because the handler awaits
+  the embedding pipeline, routing gained a thin async layer —
+  `routeAsync()` dispatches `/api/search` and delegates everything else to
+  the unchanged synchronous `route()` — and `WebContext` gained an optional
+  `embedder` (the CLI passes the shared instance; without one the endpoint
+  still answers on lexical + graph and reports why).
+- **`embed_error` field on `synapse_anchor_memory` /
+  `synapse_promote_candidate` results** — when embedding degrades, the
+  failure reason now travels back to the caller instead of a bare
+  `embedded: false`.
+
+### Fixed
+
+- **Admin UI delete auth was documented but never wired** — `WebContext`
+  documented a boot-time bearer token for destructive operations, but the
+  CLI never generated or passed one, leaving `DELETE /api/memory/:id`
+  effectively open (only mitigated by the 127.0.0.1 bind). A random
+  48-hex-char token is now generated at every boot, printed to stderr on
+  the line after the listen URL, and enforced by the existing
+  constant-time gate. Read-only endpoints stay open.
+- **Semantic retrieval silently scored an arbitrary vector subset** —
+  `getVectors()` applied `LIMIT` without `ORDER BY`, so once the corpus
+  outgrew the candidate window SQLite returned an arbitrary slice and the
+  semantic channel scored a different subset on every query. Vector scans
+  are now ordered by `entity_id` (deterministic subset) and the hybrid
+  engine scans up to 10 000 vectors per query, emitting a
+  `semantic scan truncated at 10000 vectors` warning when the cap binds
+  instead of failing silently.
+- **`GET /api/memory?q=` ignored the `scope` filter** — the FTS branch
+  never applied `scopePrefix`, so `?q=…&scope=…` returned out-of-scope
+  memories. Both filters now compose (and an empty `scope=` value means no
+  filter).
+- **Caller metadata could overwrite the `anchored_to` marker** —
+  `synapse_anchor_memory` spread user metadata after the marker, letting a
+  caller clobber the record of which scope the memory was anchored to;
+  the marker now wins.
+- **Stale-index sweep could tear mid-flight** —
+  `deleteStaleIndexedEntities()` deleted stale rows one-by-one outside a
+  transaction; a crash mid-loop left a partially-swept index. The sweep
+  now runs in a single transaction.
+- **Signal shutdown leaked the SSE server** — SIGINT/SIGTERM stopped the
+  demo feeder, the web UI, and the DB, but never closed the SSE MCP
+  server (masked by `process.exit`). The handle is now tracked
+  (`activeSse`) and closed in order (demo → SSE → web → DB); the web close
+  is awaited, and the SSE branch's in-band cleanup is best-effort so the
+  signal path and the natural-shutdown path can interleave without
+  double-close faults.
+- **Duplicated embedding decoder removed** — `queries.ts` carried a
+  byte-identical copy of `bufferToEmbedding()`; it now imports the real
+  one from `vector-math.ts`.
+- **`route()` return type no longer lies** — the declared `WebResponse`
+  hid a `null as unknown as WebResponse` static-fallback signal; the
+  signature is now `WebResponse | null` and callers/tests assert it
+  directly.
+
 ## [0.1.6] — 2026-08-16
 
 Patch release: deterministic seeded layout for the memory graph — demo mode
