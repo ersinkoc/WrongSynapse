@@ -94,9 +94,11 @@ function MemoryGraphInner() {
 }
 
 /**
- * Layout the memory graph on a grid: memory entries on the left, their
- * non-memory neighbors on the right. Cheap and deterministic — avoids
- * shipping a full dagre layout for what is effectively a 2-column graph.
+ * Layout the memory graph. When the server provided deterministic
+ * `position`s (demo mode: ctx.layoutSeed → seeded server-side layout),
+ * honor them verbatim — the same --demo-seed then paints the same picture
+ * on every client. Otherwise fall back to the local two-column grid
+ * (memory entries left, non-memory neighbors right).
  */
 function layoutGraph(data: MemoryGraphData): { nodes: Node[]; edges: Edge[] } {
   const memoryIds = new Set(data.nodes.filter((n) => n.type === 'memory_entry').map((n) => n.id));
@@ -107,7 +109,7 @@ function layoutGraph(data: MemoryGraphData): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = data.nodes.map((n) => ({
     id: n.id,
     type: n.type === 'memory_entry' ? 'memory' : 'neighbor',
-    position: { x: colX(n), y: (rowOf.get(n.id) ?? 0) * colWidth },
+    position: n.position ?? { x: colX(n), y: (rowOf.get(n.id) ?? 0) * colWidth },
     data: n,
   }));
   const edges: Edge[] = data.edges.map((e) => ({

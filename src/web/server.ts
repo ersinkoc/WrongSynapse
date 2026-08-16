@@ -35,6 +35,7 @@ import {
 } from '../db/queries.js';
 import type { SynapseDatabase } from '../db/connection.js';
 import { SERVER_VERSION } from '../mcp/server.js';
+import { createDemoRng } from '../engine/demo.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,6 +45,14 @@ export interface WebContext {
   db: SynapseDatabase;
   /** Absolute path to the static SPA directory (may not exist on disk). */
   staticDir?: string;
+  /**
+   * Deterministic graph-layout seed. When set, `/api/graph/memory` computes
+   * every node's `position` server-side (seeded per-node hash) so the same
+   * seed always yields the same coordinates; the SPA honors payload
+   * positions instead of stacking nodes. Absent → server sends no
+   * position and the SPA falls back to its local two-column grid.
+   */
+  layoutSeed?: number;
   /**
    * Bearer token required for destructive operations (DELETE). When set,
    * mutating endpoints return 401 unless the request carries a matching
@@ -193,6 +202,12 @@ interface GraphNode {
   type: string;
   scope_path: string;
   confidence: number;
+  /**
+   * Deterministic layout coordinates, emitted only when the context carries
+   * a `layoutSeed` (demo mode). Generated server-side so the SAME seed
+   * always yields the SAME picture regardless of client fetch order.
+   */
+  position?: { x: number; y: number };
 }
 
 interface GraphEdge {
@@ -208,8 +223,11 @@ interface MemoryGraph {
 }
 
 /** Build a memory-centric graph for React Flow: every memory_entry, plus every edge that touches a memory_entry.
- * The `limit` caps the total nodes returned; the response honors it even after edge expansion. */
-function buildMemoryGraph(db: SynapseDatabase, limit: number): MemoryGraph {
+ * The `limit` caps the total nodes returned; the response honors it even after edge expansion.
+ * When `layoutSeed` is set, every node also gets a deterministic `position`: memories fan out on
+ * seeded polar offsets around their anchor scope's center and neighbors sit at that center, so
+ * distinct nodes never share coordinates while the same seed always paints the same picture. */
+function buildMemoryGraph(db: SynapseDatabase, limit: number, layoutSeed?: number): MemoryGraph {
   const memoryRows = db
     .prepare(
       `SELECT id, type, scope_path, name, confidence FROM entities WHERE type = 'memory_entry' ORDER BY updated_at DESC LIMIT ?`,
@@ -333,7 +351,139 @@ function buildMemoryGraph(db: SynapseDatabase, limit: number): MemoryGraph {
     if (!visible.has(sid) || !visible.has(tid)) continue;
     edges.push({ id, source: sid, target: tid, relation: rel });
   }
+  if (layoutSeed === undefined) return { nodes, edges };
+  // Layout walks only edges the response actually shows: an ANCHORED_TO
+  // target trimmed by the post-cap visibility filter must not silently
+  // steer a memory toward a node the client cannot see.
+  const visibleEdges = edges.filter((e) => visible.has(e.source) && visible.has(e.target));
+  applySeededLayout(nodes, visibleEdges, layoutSeed);
   return { nodes, edges };
+}
+
+/**
+ * FNV-1a — short, deterministic, well-spread string hash. Used to derive a
+ * per-node PRNG stream from the shared layout seed so coordinates depend only
+ * on (seed, scope_path) — never on row order, timestamps, or query plans.
+ */
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/** Deterministic anchor centers: hash the file portion of a scope into a
+ * stable point on the canvas. Distinct anchor scopes get distinct centers
+ * with high probability; the exact value is irrelevant as long as it is a
+ * pure function of the scope string. */
+function anchorCenter(scopePath: string): { x: number; y: number } {
+  const h = fnv1a(scopePath);
+  return { x: (h % 1600) - 800, y: ((h >>> 16) % 1200) - 600 };
+}
+
+/**
+ * Assign deterministic coordinates to every graph node (server-side layout).
+ *
+ * - Non-memory neighbors (files/symbols/commits) sit at their scope's anchor
+ *   center, nudged apart deterministically when several share one file scope.
+ * - Every memory_entry fans out on a polar offset around its anchor's center.
+ * - Per-node seed mixes the node's content identity (`scope_path` + `name`)
+ *   into the shared layout seed: same-scope siblings get independent PRNG
+ *   streams, and coordinates survive entity-ID churn (new UUIDs across
+ *   fresh runs) because they never enter the hash.
+ * - Collision resolution is deterministic and unbounded: each attempt widens
+ *   the radius and draws fresh numbers, and the occupied set is finite, so a
+ *   free coordinate is always found without ever accepting an overlap.
+ * - The whole layout is a pure function of (layoutSeed, node identity):
+ *   the same seed always produces the same picture across runs, processes,
+ *   and clients. This is what lets --demo-seed pin the demo's visuals.
+ */
+function applySeededLayout(nodes: GraphNode[], edges: GraphEdge[], seed: number): void {
+  const scopeOf = new Map<string, string>(nodes.map((n) => [n.id, n.scope_path]));
+  const anchorOf = new Map<string, { x: number; y: number }>();
+  for (const node of nodes) {
+    if (node.type === 'memory_entry') continue;
+    const fileScope = fileScopeOf(node.scope_path);
+    if (!anchorOf.has(fileScope)) anchorOf.set(fileScope, anchorCenter(fileScope));
+  }
+  const assigned = new Set<string>();
+  const take = (x: number, y: number): boolean => {
+    const key = `${x}:${y}`;
+    if (assigned.has(key)) return false;
+    assigned.add(key);
+    return true;
+  };
+  // Deterministic processing order: when several nodes propose the same
+  // coordinate, whichever node is placed FIRST keeps it — so placement must
+  // run in a stable content-identity order, never in SQLite row order (which
+  // can differ across fresh databases and query plans). We sort a copy and
+  // mutate the node objects in place; the response order stays untouched.
+  const ordered = [...nodes].sort((a, b) =>
+    a.scope_path === b.scope_path ? (a.label < b.label ? -1 : 1) : a.scope_path < b.scope_path ? -1 : 1,
+  );
+  for (const node of ordered) {
+    if (node.type === 'memory_entry') continue;
+    const anchor = anchorOf.get(fileScopeOf(node.scope_path)) ?? { x: 0, y: 0 };
+    const rng = createDemoRng((seed ^ fnv1a(node.scope_path) ^ fnv1a(node.label)) >>> 0);
+    let attempt = 0;
+    for (;;) {
+      // First claim is the exact anchor center; siblings claiming the same
+      // file scope walk outward in small deterministic steps.
+      const r = attempt * 36;
+      const x = Math.round(anchor.x + Math.cos(rng() * Math.PI * 2) * r);
+      const y = Math.round(anchor.y + Math.sin(rng() * Math.PI * 2) * r);
+      if (take(x, y)) {
+        node.position = { x, y };
+        break;
+      }
+      attempt += 1;
+    }
+  }
+  for (const node of ordered) {
+    if (node.type !== 'memory_entry') continue;
+    // ANCHORED_TO edges carry entity IDs, not scopes — resolve the target's
+    // scope through the node set; an anchor trimmed by the cap falls back
+    // to the memory's own scope (its anchor is itself, at band distance 0).
+    const anchorId = anchorIdOf(edges, node.id);
+    const anchorScope = (anchorId !== undefined ? scopeOf.get(anchorId) : undefined) ?? node.scope_path;
+    const anchor = anchorOf.get(fileScopeOf(anchorScope)) ?? anchorCenter(fileScopeOf(anchorScope));
+    const rng = createDemoRng((seed ^ fnv1a(node.scope_path) ^ fnv1a(node.label)) >>> 0);
+    // Deterministic, unbounded collision resolution: every attempt widens
+    // the radius and draws fresh numbers from the node's own stream, so a
+    // free coordinate is always found and the result never depends on row
+    // order — only on (seed, scope_path, id).
+    let attempt = 0;
+    for (;;) {
+      const angle = rng() * Math.PI * 2;
+      const radius = 120 + rng() * 200 + attempt * 60;
+      const x = Math.round(anchor.x + Math.cos(angle) * radius);
+      const y = Math.round(anchor.y + Math.sin(angle) * radius);
+      if (take(x, y)) {
+        node.position = { x, y };
+        break;
+      }
+      attempt += 1;
+    }
+  }
+}
+
+/** The file portion of a scope URI — the anchor identity for layout purposes:
+ * `proj:demo/file:src/auth.ts/sym:x` → `proj:demo/file:src/auth.ts`. A scope
+ * with no file segment (bare project) is its own anchor. */
+function fileScopeOf(scopePath: string): string {
+  const idx = scopePath.indexOf('/sym:');
+  if (idx !== -1) return scopePath.slice(0, idx);
+  return scopePath;
+}
+
+/** Find the entity the ANCHORED_TO edges point this memory at (first wins). */
+function anchorIdOf(edges: GraphEdge[], memoryId: string): string | undefined {
+  for (const edge of edges) {
+    if (edge.relation === 'ANCHORED_TO' && edge.source === memoryId) return edge.target;
+  }
+  return undefined;
 }
 
 function summarizeCandidate(candidate: CandidateRow): Record<string, unknown> {
@@ -400,7 +550,7 @@ export function route(req: RouteRequest, ctx: WebContext): WebResponse {
 
   if (path === '/api/graph/memory' && method === 'GET') {
     const limit = clampLimit(url.searchParams.get('limit'), 500, 2000);
-    return jsonResponse(200, buildMemoryGraph(ctx.db, limit));
+    return jsonResponse(200, buildMemoryGraph(ctx.db, limit, ctx.layoutSeed));
   }
 
   // Static SPA fallback is handled by runWebServer (needs fs); here we only

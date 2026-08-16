@@ -276,7 +276,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   if (shouldStartWeb(cli)) {
     const webPort = resolveWebPort(cli) ?? 0;
     const spaDir = resolveSpaStaticDir(import.meta.url, dirname(fileURLToPath(import.meta.url)));
-    web = await runWebServer({ db, staticDir: spaDir }, webPort);
+    web = await runWebServer({ db, staticDir: spaDir, layoutSeed: resolveDemoSeed(cli) }, webPort);
     if (web.port > 0) {
       console.error(`WrongSynapse admin web UI listening on ${web.url}`);
       if (shouldAutoOpenBrowser(cli)) {

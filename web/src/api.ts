@@ -61,6 +61,7 @@ export interface MemoryGraph {
     type: string;
     scope_path: string;
     confidence: number;
+    position?: { x: number; y: number };
   }>;
   edges: Array<{
     id: string;

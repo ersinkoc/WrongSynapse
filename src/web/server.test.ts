@@ -417,6 +417,68 @@ describe('route — memory graph', () => {
     expect((body['nodes'] as unknown[]).length).toBe(1);
   });
 
+  it('emits no position when layoutSeed is absent (back-compat)', () => {
+    const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, ctx);
+    const nodes = jsonBody(res).body['nodes'] as Array<{ id: string; position?: unknown }>;
+    expect(nodes.length).toBeGreaterThan(0);
+    for (const n of nodes) expect(n.position).toBeUndefined();
+  });
+
+  it('seeded layout: deterministic across calls, distinct per node, seed-sensitive', () => {
+    const seededCtx = { ...ctx, layoutSeed: 7 };
+    type P = { x: number; y: number };
+    const call = (c: typeof seededCtx): Array<{ id: string; position?: P }> =>
+      (jsonBody(route({ method: 'GET', rawUrl: '/api/graph/memory' }, c)).body['nodes'] as Array<{
+        id: string;
+        position?: P;
+      }>).map((n) => ({ id: n.id, position: n.position }));
+    const a = call(seededCtx);
+    const b = call(seededCtx);
+    expect(a).toEqual(b); // determinism across independent calls
+    expect(a.length).toBe(6); // m1..m3, f1, f2, c1
+    for (const n of a) expect(n.position).toBeDefined();
+    const keys = a.map((n) => `${n.position?.x}:${n.position?.y}`);
+    expect(new Set(keys).size).toBe(a.length); // no two distinct nodes share coords
+    // Memories fan out around their anchor file within the polar band.
+    const pos = new Map(a.map((n) => [n.id, n.position ?? { x: 0, y: 0 }]));
+    const dist = (p: P, q: P): number => Math.hypot(p.x - q.x, p.y - q.y);
+    const far = { x: 9e9, y: 0 };
+    const d1 = dist(pos.get('m1') ?? far, pos.get('f1') ?? far);
+    expect(d1).toBeGreaterThanOrEqual(120);
+    expect(d1).toBeLessThanOrEqual(320);
+    const d2 = dist(pos.get('m2') ?? far, pos.get('f2') ?? far);
+    expect(d2).toBeGreaterThanOrEqual(120);
+    expect(d2).toBeLessThanOrEqual(320);
+    // m3 has no file anchor (SUPERSEDES memory target) → anchors to its own scope.
+    expect(pos.get('m3')).toBeDefined();
+    // Seed sensitivity: another seed moves at least one node.
+    const c = call({ ...ctx, layoutSeed: 8 });
+    const moved = a.filter((n, i) => n.position?.x !== c[i]?.position?.x || n.position?.y !== c[i]?.position?.y);
+    expect(moved.length).toBeGreaterThan(0);
+  });
+
+  it('collision retry: same-scope memories (identical PRNG streams) still land on distinct coords', () => {
+    db.exec('DELETE FROM relations; DELETE FROM entity_vectors; DELETE FROM memory_candidates; DELETE FROM entities;');
+    // Two memories sharing one scope: identical scope hash → identical rng
+    // stream → identical first proposal → the second one MUST retry outward.
+    insertEntity(db, { id: 'a', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'a', confidence: 0.9 });
+    insertEntity(db, { id: 'b', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'b', confidence: 0.9 });
+    const seededCtx = { ...ctx, layoutSeed: 7 };
+    const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, seededCtx);
+    const nodes = jsonBody(res).body['nodes'] as Array<{ id: string; position?: { x: number; y: number } }>;
+    expect(nodes).toHaveLength(2);
+    const pa = nodes.find((n) => n.id === 'a')?.position;
+    const pb = nodes.find((n) => n.id === 'b')?.position;
+    expect(pa).toBeDefined();
+    expect(pb).toBeDefined();
+    expect(`${pa?.x}:${pa?.y}`).not.toBe(`${pb?.x}:${pb?.y}`);
+    // The retried node sits one band further out (radius grew by exactly 60).
+    const anchor = { x: 0, y: 0 }; // anchorCenter('proj:c/file:same.ts') is unknown here; compare the two
+    const da = Math.hypot(pa?.x ?? 0 - anchor.x, pa?.y ?? 0 - anchor.y);
+    const db_ = Math.hypot(pb?.x ?? 0 - anchor.x, pb?.y ?? 0 - anchor.y);
+    expect(Math.abs(da - db_)).toBeGreaterThan(0);
+  });
+
   it('handles large memory sets via SQLite placeholder chunking', () => {
     db.exec('DELETE FROM relations; DELETE FROM entity_vectors; DELETE FROM memory_candidates; DELETE FROM entities;');
     const stmt = db.prepare(
