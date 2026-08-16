@@ -106,6 +106,15 @@ class TransformersEmbedder implements Embedder {
     const modelDir = options.localModelDir ?? process.env['SYNAPSE_MODEL_DIR'];
     if (modelDir !== undefined) {
       env.localModelPath = resolve(modelDir);
+    } else {
+      // Default cache resolution: transformers.js keys its cache on the
+      // package location (./node_modules/@huggingface/transformers/.cache),
+      // which for a global `npm i -g wrongsynapse` install lives inside the
+      // global install tree. Prefer a per-user cache directory so one
+      // downloaded model serves every project and survives reinstalls;
+      // fall back to a local .cache when HOME is unavailable.
+      const home = process.env['HOME'] ?? process.env['USERPROFILE'];
+      env.localModelPath = home !== undefined ? resolve(home, '.cache', 'wrongsynapse') : resolve('./.cache');
     }
   }
 

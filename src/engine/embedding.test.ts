@@ -81,6 +81,28 @@ describe('createEmbedder / configuration', () => {
     expect(envMock.allowRemoteModels).toBe(true);
     expect(envMock.localModelPath).toBe(resolve('/tmp/env-models'));
   });
+
+  it('defaults the model cache to a per-user directory when no model dir is given', () => {
+    // Global installs: transformers.js would otherwise cache inside the
+    // global install tree. Both home vars stubbed identically so the test
+    // is deterministic on Windows (USERPROFILE) and POSIX (HOME). Ambient
+    // SYNAPSE_MODEL_DIR is deleted so the default branch is truly reached
+    // even when the dev box exports it.
+    vi.stubEnv('SYNAPSE_MODEL_DIR', undefined);
+    vi.stubEnv('HOME', '/home/agent');
+    vi.stubEnv('USERPROFILE', '/home/agent');
+    createEmbedder();
+    expect(envMock.localModelPath).toBe(resolve('/home/agent', '.cache', 'wrongsynapse'));
+  });
+
+  it('falls back to a local .cache when no home directory is known', () => {
+    // vi.stubEnv(key, undefined) deletes the variable.
+    vi.stubEnv('SYNAPSE_MODEL_DIR', undefined);
+    vi.stubEnv('HOME', undefined);
+    vi.stubEnv('USERPROFILE', undefined);
+    createEmbedder();
+    expect(envMock.localModelPath).toBe(resolve('./.cache'));
+  });
 });
 
 describe('TransformersEmbedder lifecycle', () => {

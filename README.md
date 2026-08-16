@@ -86,6 +86,16 @@ wrongsynapse --transport sse --port 8765
 
 Each SSE connection gets its own MCP session — multiple agents can query one shared database concurrently.
 
+### Install as an agent skill (skills.sh)
+
+WrongSynapse ships a [skills.sh](https://www.skills.sh/)-compatible agent skill that automates the memory workflow (recall before work → observe during work → consolidate after). With any supported agent (Claude Code, Cursor, Codex, Copilot, and 20+ more):
+
+```bash
+npx skills add ersinkoc/WrongSynapse
+```
+
+This drops `skills/wrongsynapse/SKILL.md` into your agent's skill directory. The skill instructs the agent to use the eight `synapse_*` MCP tools — configure the MCP server as shown above (`command: wrongsynapse`) so both halves are connected. To use the skill straight from a checkout instead, copy `skills/wrongsynapse/SKILL.md` into your agent's skills folder.
+
 ---
 
 ## The eight MCP tools
