@@ -1,0 +1,64 @@
+/* WrongSynapse admin SPA — Tailwind v4 (CSS-first) with the dark-pro kit tokens.
+   Single source of truth for design: every color, radius, and font lives in
+   @theme below. Components reference utilities (bg-bg, text-fg, border-border,
+   etc.) so re-theming is a one-line change to the token table. */
+
+@import 'tailwindcss';
+
+/* Dark-first: design the dark theme as primary; light is the secondary
+   derivative. The HTML root carries class="dark" (see index.html) which
+   activates the dark token table below; the light table is available for
+   a future toggle. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* Dark theme (primary) */
+  --color-bg: oklch(17% 0.015 265);
+  --color-surface: oklch(21% 0.018 265);
+  --color-raised: oklch(25% 0.02 265);
+  --color-fg: oklch(93% 0.01 265);
+  --color-muted: oklch(66% 0.02 265);
+  --color-primary: oklch(72% 0.18 200);
+  --color-accent: oklch(70% 0.2 145);
+  --color-success: oklch(72% 0.17 150);
+  --color-warning: oklch(78% 0.15 80);
+  --color-danger: oklch(66% 0.2 25);
+  --color-border: oklch(28% 0.018 265);
+  --color-ring: oklch(72% 0.18 200);
+
+  /* Typography — Inter / Geist for sans, JetBrains Mono / Geist Mono for code */
+  --font-sans: 'Inter', 'Geist', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Geist Mono', ui-monospace, monospace;
+
+  /* Density: compact rows, monospace for code/IDs/numbers, tabular nums */
+  --radius-sm: 0.165rem;
+  --radius-md: 0.33rem;
+  --radius-lg: 0.5rem;
+
+  /* Motion: quick and precise (100–160ms ease-out) */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+}
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+  /* Tabular numerics for stats tables and ID columns */
+  .font-mono, code, kbd, samp {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Reduced motion: drop glows/transitions */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}

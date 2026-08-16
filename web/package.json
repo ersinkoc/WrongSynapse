@@ -1,0 +1,28 @@
+{
+  "name": "@wrongsynapse/web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Optional admin web UI for WrongSynapse (single-page, dark-pro design, React Flow graph).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "dependencies": {
+    "@radix-ui/themes": "^3.3.0",
+    "@xyflow/react": "^12.11.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1"
+  }
+}

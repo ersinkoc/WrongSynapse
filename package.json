@@ -42,7 +42,11 @@
     "test:coverage": "vitest run --coverage",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "release": "node scripts/release.mjs",
-    "release:check": "node scripts/release.mjs --check"
+    "release:check": "node scripts/release.mjs --check",
+    "web:install": "npm --prefix web install",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web install --no-audit --no-fund && npm --prefix web run build",
+    "web:typecheck": "npm --prefix web run typecheck"
   },
   "keywords": [
     "mcp",

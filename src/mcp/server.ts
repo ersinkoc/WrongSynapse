@@ -15,8 +15,20 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { registerTools, type ToolContext } from './tools/index.js';
 import { TOOL_DEFINITIONS } from './tools/definitions.js';
 
+// Single source of truth for the version: package.json. Deriving
+// SERVER_VERSION via createRequire means `wrongsynapse --version` and the
+// MCP handshake can never drift from the published package version again
+// (they drifted in 0.1.0–0.1.2: the literal said 0.1.0 after the bump).
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const require = createRequire(import.meta.url);
+const packageDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const { version: PACKAGE_VERSION } = require(join(packageDir, 'package.json')) as { version: string };
+
 export const SERVER_NAME = 'wrongsynapse';
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = PACKAGE_VERSION;
 
 /** Build an MCP server with every WrongSynapse tool registered. */
 export function createSynapseServer(ctx: ToolContext): McpServer {
