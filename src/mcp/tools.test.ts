@@ -7,6 +7,7 @@ import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
 import { findEntitiesByScope, getCandidate, getEntity, getNeighbors, insertEntity, insertRelation } from '../db/queries.js';
 import { FakeEmbedder, FailingEmbedder } from '../../test/helpers/fake-embedder.js';
+import type { Embedder } from '../engine/embedding.js';
 import { TOOL_DEFINITIONS } from './tools/definitions.js';
 import type { ToolContext, ToolDefinition } from './tools/index.js';
 
@@ -416,5 +417,29 @@ describe('embedding-unavailable degradation (anchored memories)', () => {
     const parsed = JSON.parse(out.content[0]!.text) as { entity_id: string; embedded: boolean };
     expect(parsed.embedded).toBe(false);
     expect(getCandidate(db, candidateId)?.status).toBe('promoted');
+  });
+
+  it('reports the embed failure reason, including non-Error throws', async () => {
+    // A rejected promise with a plain string (e.g. a library that throws
+    // response bodies) must surface as embed_error, not crash the handler.
+    const stringThrower: Embedder = {
+      modelId: 'string-thrower',
+      dimension: 16,
+      isReady: () => true,
+      init: async () => undefined,
+      embed: async () => {
+        throw 'embedding service exploded';
+      },
+      embedBatch: async () => {
+        throw 'embedding service exploded';
+      },
+    };
+    const out = await tool('synapse_anchor_memory').handler({ db, embedder: stringThrower }, {
+      content: 'string failure note',
+      target_scope: 'proj:demo/file:fail.ts',
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { embedded: boolean; embed_error: string | null };
+    expect(parsed.embedded).toBe(false);
+    expect(parsed.embed_error).toBe('embedding service exploded');
   });
 });

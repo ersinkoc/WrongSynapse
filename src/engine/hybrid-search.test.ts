@@ -181,3 +181,31 @@ describe('hybridSearch', () => {
     }
   });
 });
+
+describe('hybridSearch — semantic scan cap', () => {
+  it('warns when the vector scan hits the deterministic cap', async () => {
+    // Fresh db: 10k filler vectors must not pollute the shared fixtures.
+    const bulkDb = await openDatabase(':memory:');
+    migrate(bulkDb);
+    try {
+      bulkDb.transaction(() => {
+        for (let i = 0; i < 10_000; i += 1) {
+          const id = `bulk-${i}`;
+          insertEntity(bulkDb, {
+            id,
+            type: 'file',
+            scopePath: `proj:bulk/file:${i}.ts`,
+            name: `bulk-${i}.ts`,
+            content: 'bulk filler row',
+          });
+          upsertVector(bulkDb, id, new Float32Array(16));
+        }
+      });
+      const out = await hybridSearch(bulkDb, embedder, { query: 'token validation', limit: 1 });
+      expect(out.vectorRetrievalUsed).toBe(true);
+      expect(out.warnings.some((w) => w.includes('semantic scan truncated at 10000 vectors'))).toBe(true);
+    } finally {
+      bulkDb.close();
+    }
+  });
+});

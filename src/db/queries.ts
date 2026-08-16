@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { embeddingToBuffer } from '../engine/vector-math.js';
+import { bufferToEmbedding, embeddingToBuffer } from '../engine/vector-math.js';
 
 import type { SqlValue, SynapseDatabase } from './connection.js';
 
@@ -310,9 +310,13 @@ export function deleteStaleIndexedEntities(
   const stale = rows
     .map((row) => reqStr(row, 'id'))
     .filter((id) => !keepIds.has(id));
-  for (const id of stale) {
-    db.prepare('DELETE FROM entities WHERE id = ?').run(id);
-  }
+  // One transaction for the whole sweep: a crash mid-loop would otherwise
+  // leave a partially-deleted index (some stale rows gone, others revived).
+  db.transaction(() => {
+    for (const id of stale) {
+      db.prepare('DELETE FROM entities WHERE id = ?').run(id);
+    }
+  });
   return stale.length;
 }
 
@@ -368,8 +372,7 @@ export function deleteVector(db: SynapseDatabase, entityId: string): void {
 
 function decodeEmbedding(value: unknown): Float32Array {
   if (!(value instanceof Uint8Array)) throw new TypeError('embedding column is not a BLOB');
-  const bytes = value.byteLength - (value.byteLength % 4);
-  return new Float32Array(value.buffer, value.byteOffset, bytes / 4);
+  return bufferToEmbedding(value);
 }
 
 /** Fetch embeddings joined with their entities, optionally scope/type filtered. */
@@ -384,12 +387,16 @@ export function getVectors(db: SynapseDatabase, options: VectorQuery = {}): Vect
   }
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(limit);
+  // ORDER BY entity_id makes the LIMIT subset deterministic: without it,
+  // SQLite returns an arbitrary page and the semantic channel of hybrid
+  // search would silently score a different slice on every query.
   const rows = db
     .prepare(
       `SELECT v.entity_id, e.scope_path, e.type, v.embedding
        FROM entity_vectors v
        JOIN entities e ON e.id = v.entity_id
        ${where}
+       ORDER BY v.entity_id
        LIMIT ?`,
     )
     .all(...params);

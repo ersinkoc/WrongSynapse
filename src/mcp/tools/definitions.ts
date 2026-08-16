@@ -32,7 +32,7 @@ import {
 import { hybridSearch } from '../../engine/hybrid-search.js';
 import { indexWorkspace } from '../../engine/parser.js';
 import { parseScope } from '../../utils/scope.js';
-import { jsonResult, type ToolArgs, type ToolDefinition } from './index.js';
+import { jsonResult, type ToolArgs, type ToolContext, type ToolDefinition } from './index.js';
 
 // ---------------------------------------------------------------------------
 // Arg coercion helpers
@@ -71,6 +71,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function truncate(text: string | null, max: number): string | null {
   if (text === null) return null;
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Embed `text` and upsert the vector, reporting WHY the semantic channel
+ * degraded instead of a bare `embedded: false` (embed() awaits init()
+ * internally, so no explicit init() here).
+ */
+async function embedOrReport(
+  ctx: ToolContext,
+  entityId: string,
+  text: string,
+): Promise<{ embedded: boolean; embedError: string | null }> {
+  try {
+    upsertVector(ctx.db, entityId, await ctx.embedder.embed(text));
+    return { embedded: true, embedError: null };
+  } catch (error) {
+    return { embedded: false, embedError: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,26 +225,22 @@ const anchorMemoryTool: ToolDefinition = {
       scopePath: targetScope,
       name: content.slice(0, 80),
       content,
-      metadata: { anchored_to: targetScope, ...(metadata ?? {}) },
+      // anchored_to LAST: caller metadata must not be able to overwrite the
+      // marker that says which scope this memory was anchored to.
+      metadata: { ...(metadata ?? {}), anchored_to: targetScope },
     });
     const target = getEntityByScope(ctx.db, targetScope, STRUCTURAL_TARGET_TYPES);
     if (target !== undefined) {
       insertRelation(ctx.db, { sourceId: id, targetId: target.id, relation: relationType });
     }
-    let embedded = false;
-    try {
-      await ctx.embedder.init();
-      upsertVector(ctx.db, id, await ctx.embedder.embed(content));
-      embedded = true;
-    } catch {
-      embedded = false;
-    }
+    const { embedded, embedError } = await embedOrReport(ctx, id, content);
     return jsonResult({
       entity_id: id,
       scope_path: targetScope,
       relation: relationType,
       anchored_to_entity_id: target?.id ?? null,
       embedded,
+      embed_error: embedError,
     });
   },
 };
@@ -350,14 +364,7 @@ const promoteCandidateTool: ToolDefinition = {
     if (target !== undefined) {
       insertRelation(ctx.db, { sourceId: id, targetId: target.id, relation: 'ANCHORED_TO' });
     }
-    let embedded = false;
-    try {
-      await ctx.embedder.init();
-      upsertVector(ctx.db, id, await ctx.embedder.embed(candidate.content));
-      embedded = true;
-    } catch {
-      embedded = false;
-    }
+    const { embedded, embedError } = await embedOrReport(ctx, id, candidate.content);
     setCandidateStatus(ctx.db, candidateId, 'promoted');
     return jsonResult({
       entity_id: id,
@@ -365,6 +372,7 @@ const promoteCandidateTool: ToolDefinition = {
       promoted_candidate: candidateId,
       anchored_to_entity_id: target?.id ?? null,
       embedded,
+      embed_error: embedError,
     });
   },
 };

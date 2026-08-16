@@ -51,6 +51,15 @@ export interface HybridSearchOutput {
 
 const RRF_K = 60;
 const MAX_CANDIDATES = 100;
+/**
+ * Upper bound on vectors loaded per query for the semantic channel. Loading
+ * is a full scan (there is no ANN index), so this caps transient memory
+ * (~1.5 KB per 384-dim vector). getVectors orders by entity_id, so a
+ * truncated scan is at least a deterministic subset — and the caller is
+ * told about the truncation via a warning instead of silently scoring an
+ * arbitrary slice.
+ */
+const VECTOR_SCAN_CAP = 10_000;
 const SEED_LIMIT = 5;
 const NEIGHBOR_CAP = 50;
 
@@ -80,7 +89,7 @@ export async function hybridSearch(
     graphDepth = 1,
   } = options;
   const warnings: string[] = [];
-  const typesFilter = types.length > 0 ? [...types] : [];
+  const typesFilter = [...types];
 
   // ---- 1. Lexical (FTS5 / BM25) -------------------------------------------
   const ftsRanked: string[] = [];
@@ -107,8 +116,11 @@ export async function hybridSearch(
       const candidates = getVectors(db, {
         scopePrefixes: scopes.length > 0 ? [...scopes] : undefined,
         types: typesFilter,
-        limit: MAX_CANDIDATES,
+        limit: VECTOR_SCAN_CAP,
       });
+      if (candidates.length >= VECTOR_SCAN_CAP) {
+        warnings.push(`semantic scan truncated at ${VECTOR_SCAN_CAP} vectors (deterministic subset by entity id)`);
+      }
       const scored: { id: string; score: number }[] = [];
       for (const candidate of candidates) {
         if (!matchesFilters(candidate.scopePath, candidate.type, scopes, typesFilter)) continue;
