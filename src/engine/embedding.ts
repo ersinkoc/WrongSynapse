@@ -4,11 +4,13 @@
  *
  * Model: `Xenova/all-MiniLM-L6-v2` (384-dim, mean-pooled, L2-normalized).
  *
- * Zero cloud: model files are read from the local filesystem cache. Remote
- * fetching is disabled by default; set `SYNAPSE_ALLOW_REMOTE_MODEL=1` once to
- * download the model into the cache, after which everything runs offline.
- * `SYNAPSE_MODEL_DIR` / `SYNAPSE_EMBEDDING_MODEL` override the model location
- * and id.
+ * Run-and-use: the model is read from the local filesystem cache, and when it
+ * is not cached yet it is downloaded ONCE automatically (≈ 25 MB from the
+ * HuggingFace CDN) — after that everything runs offline. Strict-offline
+ * deployments can forbid the download with `noRemoteModels` /
+ * `SYNAPSE_NO_REMOTE_MODEL=1`; `SYNAPSE_ALLOW_REMOTE_MODEL=1` keeps the older
+ * always-allow semantics. `SYNAPSE_MODEL_DIR` / `SYNAPSE_EMBEDDING_MODEL`
+ * override the model location and id.
  */
 
 import { env, pipeline, type Tensor } from '@huggingface/transformers';
@@ -28,8 +30,35 @@ export interface Embedder {
 export interface EmbeddingOptions {
   modelId?: string;
   localModelDir?: string;
+  /** Always allow remote model fetches (legacy opt-in; the default already
+   * downloads once on a cache miss). */
   allowRemoteModels?: boolean;
+  /** Never touch the network: load from cache or fail (strict offline). */
+  noRemoteModels?: boolean;
   maxBatchSize?: number;
+}
+
+/**
+ * How the embedder may reach the model:
+ * - 'auto'  (default) local cache first; on a miss, download once, then
+ *   return to local-only for the rest of the process.
+ * - 'allow' remote fetching enabled up front (SYNAPSE_ALLOW_REMOTE_MODEL=1).
+ * - 'never' strict offline (SYNAPSE_NO_REMOTE_MODEL=1 / noRemoteModels).
+ */
+export type RemoteModelMode = 'auto' | 'allow' | 'never';
+
+/** Pure resolution of options + environment into a {@link RemoteModelMode}. */
+export function resolveRemoteMode(
+  options: Pick<EmbeddingOptions, 'allowRemoteModels' | 'noRemoteModels'>,
+  envVars: Record<string, string | undefined> = process.env,
+): RemoteModelMode {
+  if (options.allowRemoteModels === true) return 'allow';
+  // An explicit false is a deliberate opt-out (pre-'auto' callers passed it
+  // to mean "never fetch") — honor it as strict offline.
+  if (options.noRemoteModels === true || options.allowRemoteModels === false) return 'never';
+  if (envVars['SYNAPSE_ALLOW_REMOTE_MODEL'] === '1') return 'allow';
+  if (envVars['SYNAPSE_NO_REMOTE_MODEL'] === '1') return 'never';
+  return 'auto';
 }
 
 export const DEFAULT_EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
@@ -94,14 +123,18 @@ class TransformersEmbedder implements Embedder {
   readonly modelId: string;
   readonly dimension = EMBEDDING_DIMENSION;
   readonly maxBatchSize: number;
+  private readonly remoteMode: RemoteModelMode;
   private extractor: FeatureExtractionPipelineLike | null = null;
   private initPromise: Promise<void> | null = null;
 
   constructor(options: EmbeddingOptions = {}) {
     this.modelId = options.modelId ?? process.env['SYNAPSE_EMBEDDING_MODEL'] ?? DEFAULT_EMBEDDING_MODEL;
     this.maxBatchSize = options.maxBatchSize ?? 32;
+    this.remoteMode = resolveRemoteMode(options);
     // `env` is a process-global singleton; configure it at construction time.
-    env.allowRemoteModels = options.allowRemoteModels ?? process.env['SYNAPSE_ALLOW_REMOTE_MODEL'] === '1';
+    // 'auto' and 'never' start local-only — the 'auto' download happens as a
+    // single explicit retry in load(), never as an ambient fetch.
+    env.allowRemoteModels = this.remoteMode === 'allow';
     env.allowLocalModels = true;
     const modelDir = options.localModelDir ?? process.env['SYNAPSE_MODEL_DIR'];
     if (modelDir !== undefined) {
@@ -141,15 +174,44 @@ class TransformersEmbedder implements Embedder {
 
   private async load(): Promise<void> {
     try {
-      const factory = await pipeline('feature-extraction', this.modelId, { dtype: 'q8' });
-      this.extractor = factory as unknown as FeatureExtractionPipelineLike;
+      await this.tryLoadPipeline();
+      return;
     } catch (error) {
-      throw new Error(
-        `Failed to load embedding model '${this.modelId}'. If it is not cached locally and you are ` +
-          `offline, run once with SYNAPSE_ALLOW_REMOTE_MODEL=1 to download it (one-time bootstrap), or point ` +
-          `SYNAPSE_MODEL_DIR at a directory containing the model files. Underlying error: ${describeError(error)}`,
-      );
+      // 'auto': the local-only attempt missed the cache — retry exactly once
+      // with remote fetching enabled so the model downloads into the cache.
+      // 'allow' already fetched remote in tryLoadPipeline; 'never' must stay
+      // offline. Both surface the ORIGINAL error with a mode-specific hint.
+      if (this.remoteMode !== 'auto') {
+        const context =
+          this.remoteMode === 'never'
+            ? 'Strict-offline mode is on, so no download was attempted. '
+            : 'Remote fetching was allowed but the model still could not be loaded (no network?). ';
+        throw this.describeLoadFailure(error, context);
+      }
     }
+    try {
+      env.allowRemoteModels = true;
+      await this.tryLoadPipeline();
+    } catch (error) {
+      throw this.describeLoadFailure(error, 'The automatic one-time model download failed (no network?). ');
+    } finally {
+      // Back to local-only: the one-time download is the only network this
+      // process ever performs.
+      env.allowRemoteModels = false;
+    }
+  }
+
+  private async tryLoadPipeline(): Promise<void> {
+    const factory = await pipeline('feature-extraction', this.modelId, { dtype: 'q8' });
+    this.extractor = factory as unknown as FeatureExtractionPipelineLike;
+  }
+
+  private describeLoadFailure(error: unknown, context: string): Error {
+    return new Error(
+      `Failed to load embedding model '${this.modelId}'. ${context}` +
+        `Connect once so the ≈25 MB model can be cached automatically, or point SYNAPSE_MODEL_DIR at a ` +
+        `directory containing the model files. Underlying error: ${describeError(error)}`,
+    );
   }
 
   /* v8 ignore start -- unreachable via the public API: embed()/embedBatch() always await init() first, which either sets the extractor or throws */

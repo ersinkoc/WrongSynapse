@@ -37,6 +37,7 @@ interface CliValues {
   index?: string;
   'model-dir'?: string;
   'allow-remote-model'?: boolean;
+  'no-remote-model'?: boolean;
   git?: boolean;
   help?: boolean;
   version?: boolean;
@@ -59,7 +60,8 @@ OPTIONS
   --port <number>           SSE HTTP port (default: 8765)
   --db <path>               SQLite database path (default: ./synapse.db, env SYNAPSE_DB_PATH)
   --model-dir <dir>         Local model files (env SYNAPSE_MODEL_DIR)
-  --allow-remote-model      Allow one-time model download (env SYNAPSE_ALLOW_REMOTE_MODEL=1)
+  --allow-remote-model      Always allow remote model fetches (env SYNAPSE_ALLOW_REMOTE_MODEL=1)
+  --no-remote-model         Never touch the network: cache-only model loads (env SYNAPSE_NO_REMOTE_MODEL=1)
   --index <workspace>       One-shot: index a workspace and exit (JSON stats)
   --git                     With --index: also link git commit history
   --no-web                  Disable the optional admin web UI (default: enabled, env SYNAPSE_WEB=0 to disable)
@@ -76,7 +78,9 @@ ENVIRONMENT
   SYNAPSE_DB_PATH           Database path (default ./synapse.db)
   SYNAPSE_MODEL_DIR         Local model directory (offline inference)
   SYNAPSE_EMBEDDING_MODEL   Override embedding model id (default Xenova/all-MiniLM-L6-v2)
-  SYNAPSE_ALLOW_REMOTE_MODEL  Set to 1 to allow a one-time model download (then go offline)
+  SYNAPSE_ALLOW_REMOTE_MODEL  Set to 1 to always allow remote model fetches (the default already
+                            downloads the model once automatically on first use)
+  SYNAPSE_NO_REMOTE_MODEL   Set to 1 for strict offline: never download, cache-only
   SYNAPSE_PORT              SSE HTTP port when --port is absent (default 8765)
   SYNAPSE_WEB               Set to 0 to disable the optional admin web UI (default: enabled)
   SYNAPSE_WEB_PORT          Web UI port (default: kernel-assigned free port — different on every start)
@@ -171,17 +175,21 @@ async function maybeOpenBrowser(url: string): Promise<void> {
     /* v8 ignore start */
     // The win32 + darwin arms are OS-specific and unreachable on linux CI
     // (where the coverage gate runs). The CI host picks the `xdg-open` arm;
-    // the macOS `open` and Windows `start` arms are exercised in production
-    // but not by CI tests. Marked defensive — no `process.platform` stub
-    // gymnastics to cover them.
-    const cmd = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    // the macOS `open` and Windows arms are exercised in production but not
+    // by CI tests. Marked defensive — no `process.platform` stub gymnastics
+    // to cover them. Windows: `start` is a cmd.exe BUILTIN, not an .exe —
+    // spawning it directly fails with ENOENT, so go through cmd.exe (the
+    // empty "" title argument keeps `start` from treating the URL as one).
+    const useCmd = process.platform === 'win32';
+    const cmd = useCmd ? 'cmd' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const args = useCmd ? ['/c', 'start', '', url] : [url];
     /* v8 ignore stop */
     // `spawn` is asynchronous: the synchronous throw only catches "no such
     // binary at fork time"; the real failure (ENOENT when the host resolves
     // the command later, exec-mismatch, etc.) arrives on the ChildProcess's
     // 'error' event. A no-op listener routes that into the void; `unref()`
     // keeps the (potentially-orphaned) child from blocking event-loop exit.
-    const child = cp.spawn(cmd, [url], { detached: true, stdio: 'ignore' });
+    const child = cp.spawn(cmd, args, { detached: true, stdio: 'ignore' });
     /* v8 ignore next -- OS-specific: fires only when the spawned opener dies
        asynchronously (no xdg-open on headless CI); the win32 `start` arm
        exercises it in local runs but not on the linux coverage host. */
@@ -202,6 +210,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
       index: { type: 'string' },
       'model-dir': { type: 'string' },
       'allow-remote-model': { type: 'boolean', default: false },
+      'no-remote-model': { type: 'boolean', default: false },
       git: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
       version: { type: 'boolean', short: 'v', default: false },
@@ -254,9 +263,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
 
   const modelDir = cli['model-dir'] !== undefined && cli['model-dir'] !== '' ? cli['model-dir'] : undefined;
   const allowRemote = cli['allow-remote-model'] === true || process.env['SYNAPSE_ALLOW_REMOTE_MODEL'] === '1';
-  const embedder = getSharedEmbedder(
-    modelDir !== undefined || allowRemote ? { localModelDir: modelDir, allowRemoteModels: allowRemote } : undefined,
-  );
+  const noRemote = cli['no-remote-model'] === true || process.env['SYNAPSE_NO_REMOTE_MODEL'] === '1';
+  const embedder = getSharedEmbedder({
+    localModelDir: modelDir,
+    // undefined falls through to the 'auto' default (local-first, one-time
+    // download on cache miss); only an explicit true pins a mode.
+    allowRemoteModels: allowRemote ? true : undefined,
+    noRemoteModels: noRemote ? true : undefined,
+  });
   const ctx = { db, embedder };
 
   // One-shot workspace index mode
@@ -468,8 +482,8 @@ export { openDatabase } from './db/connection.js';
 export type { SynapseDatabase, SynapseStatement, SqlValue } from './db/connection.js';
 export { migrate, assertFts5, SCHEMA_VERSION } from './db/schema.js';
 export * from './db/queries.js';
-export { createEmbedder, getSharedEmbedder, DEFAULT_EMBEDDING_MODEL } from './engine/embedding.js';
-export type { Embedder, EmbeddingOptions } from './engine/embedding.js';
+export { createEmbedder, getSharedEmbedder, resolveRemoteMode, DEFAULT_EMBEDDING_MODEL } from './engine/embedding.js';
+export type { Embedder, EmbeddingOptions, RemoteModelMode } from './engine/embedding.js';
 export { DemoFeeder, createDemoRng, decideConsolidation, DEFAULT_DEMO_INTERVAL_MS, DEMO_PROMOTE_THRESHOLD } from './engine/demo.js';
 export type { DemoFeederOptions, DemoScheduler } from './engine/demo.js';
 export { hybridSearch } from './engine/hybrid-search.js';

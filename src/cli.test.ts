@@ -23,7 +23,15 @@ function runCli(args: string[]): string {
   return execFileSync('node', ['--import', 'tsx', join(ROOT, 'src', 'index.ts'), ...args], {
     cwd: ROOT,
     encoding: 'utf8',
-    env: { ...process.env, SYNAPSE_DB_PATH: join(workDir, 'cli.db') },
+    env: {
+      ...process.env,
+      SYNAPSE_DB_PATH: join(workDir, 'cli.db'),
+      // Tests must never touch the network: the embedder's default 'auto'
+      // mode would otherwise attempt the one-time model download on hosts
+      // without a warm cache (CI). Strict-offline fails fast and the
+      // indexer degrades to a no-vectors warning, as it always has.
+      SYNAPSE_NO_REMOTE_MODEL: '1',
+    },
   });
 }
 

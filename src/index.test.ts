@@ -221,20 +221,41 @@ describe('CLI main()', () => {
     expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 8765);
   });
 
-  it('treats an empty --model-dir as absent', async () => {
+  it('treats an empty --model-dir as absent (auto mode: undefined pins nothing)', async () => {
     await main(['--index', '/tmp/ws', '--model-dir', '']);
-    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith(undefined);
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({
+      localModelDir: undefined,
+      allowRemoteModels: undefined,
+      noRemoteModels: undefined,
+    });
   });
 
   it('passes model-dir and remote-model options to the embedder', async () => {
     await main(['--index', '/tmp/ws', '--model-dir', '/m', '--allow-remote-model']);
-    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({ localModelDir: '/m', allowRemoteModels: true });
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({
+      localModelDir: '/m',
+      allowRemoteModels: true,
+      noRemoteModels: undefined,
+    });
+  });
+
+  it('passes strict-offline through to the embedder', async () => {
+    await main(['--index', '/tmp/ws', '--no-remote-model']);
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({
+      localModelDir: undefined,
+      allowRemoteModels: undefined,
+      noRemoteModels: true,
+    });
   });
 
   it('allows the remote model via env alone', async () => {
     vi.stubEnv('SYNAPSE_ALLOW_REMOTE_MODEL', '1');
     await main(['--index', '/tmp/ws']);
-    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({ localModelDir: undefined, allowRemoteModels: true });
+    expect(mocks.getSharedEmbedder).toHaveBeenCalledWith({
+      localModelDir: undefined,
+      allowRemoteModels: true,
+      noRemoteModels: undefined,
+    });
   });
 
   it('closes the database after a one-shot index', async () => {

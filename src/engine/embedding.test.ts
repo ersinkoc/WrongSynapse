@@ -26,7 +26,7 @@ vi.mock('@huggingface/transformers', () => ({
 
 const { envMock, pipelineMock } = mocks;
 
-import { createEmbedder, getSharedEmbedder, DEFAULT_EMBEDDING_MODEL } from './embedding.js';
+import { createEmbedder, getSharedEmbedder, resolveRemoteMode, DEFAULT_EMBEDDING_MODEL } from './embedding.js';
 
 class FakeTensor {
   readonly data: Float32Array;
@@ -65,6 +65,16 @@ describe('createEmbedder / configuration', () => {
     // localModelPath/cacheDir are resolved to absolute paths by the embedder
     expect(envMock.localModelPath).toBe(resolve('/tmp/models'));
     expect(envMock.cacheDir).toBe(resolve('/tmp/models'));
+  });
+
+  it('starts local-only in the default auto mode (no ambient remote fetches)', () => {
+    createEmbedder();
+    expect(envMock.allowRemoteModels).toBe(false);
+  });
+
+  it('stays local-only when strict offline is requested', () => {
+    createEmbedder({ noRemoteModels: true });
+    expect(envMock.allowRemoteModels).toBe(false);
   });
 
   it('defaults to the canonical model id', () => {
@@ -156,17 +166,51 @@ describe('TransformersEmbedder lifecycle', () => {
     expect(pipelineMock).not.toHaveBeenCalled();
   });
 
-  it('wraps pipeline load failures with a descriptive error', async () => {
+  it('wraps pipeline load failures with a descriptive error (strict offline, single attempt)', async () => {
     pipelineMock.mockRejectedValue(new Error('network offline'));
-    const embedder = createEmbedder({ allowRemoteModels: false });
-    await expect(embedder.init()).rejects.toThrow(/Failed to load embedding model/);
+    const embedder = createEmbedder({ noRemoteModels: true });
+    await expect(embedder.init()).rejects.toThrow(
+      /Failed to load embedding model.*Strict-offline mode is on.*network offline/s,
+    );
     expect(embedder.isReady()).toBe(false);
+    // 'never' must not retry: exactly one pipeline attempt.
+    expect(pipelineMock).toHaveBeenCalledTimes(1);
   });
 
-  it('stringifies non-Error pipeline failures', async () => {
+  it('downloads the model once on a cache miss in the default auto mode', async () => {
+    // First attempt (local-only) misses the cache; the auto retry downloads
+    // and succeeds — after which the process returns to local-only.
+    pipelineMock.mockRejectedValueOnce(new Error('local file was not found'));
+    installPipeline('vector');
+    const embedder = createEmbedder();
+    await embedder.init();
+    expect(embedder.isReady()).toBe(true);
+    expect(pipelineMock).toHaveBeenCalledTimes(2);
+    expect(envMock.allowRemoteModels).toBe(false);
+  });
+
+  it('reports a failed auto download (offline) and returns to local-only', async () => {
+    pipelineMock.mockRejectedValue(new Error('fetch failed'));
+    const embedder = createEmbedder();
+    await expect(embedder.init()).rejects.toThrow(
+      /automatic one-time model download failed.*fetch failed/s,
+    );
+    expect(envMock.allowRemoteModels).toBe(false);
+    expect(pipelineMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry in legacy allow mode (remote was already enabled)', async () => {
+    pipelineMock.mockRejectedValue(new Error('connection refused'));
+    const embedder = createEmbedder({ allowRemoteModels: true });
+    await expect(embedder.init()).rejects.toThrow(/Remote fetching was allowed.*connection refused/s);
+    expect(pipelineMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('stringifies non-Error pipeline failures (both auto attempts)', async () => {
     pipelineMock.mockRejectedValue('raw string failure');
     const embedder = createEmbedder();
     await expect(embedder.init()).rejects.toThrow(/raw string failure/);
+    expect(pipelineMock).toHaveBeenCalledTimes(2);
   });
 
   it('shares one in-flight init promise between concurrent callers', async () => {
@@ -181,8 +225,10 @@ describe('TransformersEmbedder lifecycle', () => {
   });
 
   it('allows a retry after a failed load', async () => {
+    // Strict offline so a failing load is exactly one attempt (the auto
+    // mode would consume the mockRejectedValueOnce on its download retry).
     pipelineMock.mockRejectedValueOnce(new Error('first fail'));
-    const embedder = createEmbedder();
+    const embedder = createEmbedder({ noRemoteModels: true });
     await expect(embedder.init()).rejects.toThrow();
     installPipeline('vector');
     await expect(embedder.init()).resolves.toBeUndefined();
@@ -191,7 +237,7 @@ describe('TransformersEmbedder lifecycle', () => {
 
   it('throws when embedding before a successful init', async () => {
     pipelineMock.mockRejectedValue(new Error('offline'));
-    const embedder = createEmbedder();
+    const embedder = createEmbedder({ noRemoteModels: true });
     await expect(embedder.embed('x')).rejects.toThrow();
   });
 });
@@ -199,6 +245,38 @@ describe('TransformersEmbedder lifecycle', () => {
 describe('getSharedEmbedder', () => {
   it('returns the same singleton instance', () => {
     expect(getSharedEmbedder()).toBe(getSharedEmbedder());
+  });
+});
+
+describe('resolveRemoteMode', () => {
+  /** Explicit env map so ambient variables never leak into the matrix. */
+  const vars = (over: Record<string, string> = {}): Record<string, string | undefined> => ({
+    SYNAPSE_ALLOW_REMOTE_MODEL: undefined,
+    SYNAPSE_NO_REMOTE_MODEL: undefined,
+    ...over,
+  });
+
+  it('defaults to auto (local-first, one-time download on a cache miss)', () => {
+    expect(resolveRemoteMode({}, vars())).toBe('auto');
+  });
+
+  it('treats an explicit allowRemoteModels:false as a deliberate offline opt-out', () => {
+    expect(resolveRemoteMode({ allowRemoteModels: true }, vars())).toBe('allow');
+    expect(resolveRemoteMode({ allowRemoteModels: false }, vars())).toBe('never');
+  });
+
+  it('maps noRemoteModels:true to strict offline', () => {
+    expect(resolveRemoteMode({ noRemoteModels: true }, vars())).toBe('never');
+  });
+
+  it('maps the environment variables when no options are given', () => {
+    expect(resolveRemoteMode({}, vars({ SYNAPSE_ALLOW_REMOTE_MODEL: '1' }))).toBe('allow');
+    expect(resolveRemoteMode({}, vars({ SYNAPSE_NO_REMOTE_MODEL: '1' }))).toBe('never');
+  });
+
+  it('lets options win over the environment', () => {
+    expect(resolveRemoteMode({ noRemoteModels: true }, vars({ SYNAPSE_ALLOW_REMOTE_MODEL: '1' }))).toBe('never');
+    expect(resolveRemoteMode({ allowRemoteModels: true }, vars({ SYNAPSE_NO_REMOTE_MODEL: '1' }))).toBe('allow');
   });
 });
 
