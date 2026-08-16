@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-08-16
+
+Patch release: deterministic seeded layout for the memory graph — demo mode
+no longer stacks every memory node at a single point.
+
+### Fixed
+
+- **Graph view: memory nodes no longer stack on one point in demo mode.**
+  `/api/graph/memory` now computes node coordinates server-side whenever the
+  context carries a `layoutSeed` (the CLI passes `resolveDemoSeed`, so
+  `--demo-seed` drives the layout): every `memory_entry` fans out on a
+  deterministic polar band (radius 120–320) around its `ANCHORED_TO` anchor
+  scope's hashed center, while non-memory neighbors sit at that center with
+  a deterministic nudge. Per-node coordinates derive from
+  `mulberry32(seed ^ fnv1a(scope_path) ^ fnv1a(label))` — a pure function of
+  content identity, so the same seed paints the same picture across runs,
+  processes, and clients (entity-UUID churn cannot move a node). Collisions
+  resolve through unbounded deterministic retry (no overlap is ever
+  accepted) and placement runs in content-sorted order, immune to SQLite row
+  order. The web UI honors payload positions verbatim; without a seed the
+  server sends no positions and the SPA keeps its local two-column grid, so
+  existing consumers are unaffected. Demo-mode contracts are untouched
+  (5-tick consolidation, `proj:demo/` namespace, `ANCHORED_TO` edge
+  generation, discard terminality) — only node positions changed. Verified
+  live with `--demo-seed 7` across two fresh processes: 7/7 shared nodes at
+  identical coordinates, zero drift, all positions unique.
+
 ## [0.1.5] — 2026-08-16
 
 Patch release: demo mode — continuous synthetic memory ingestion, hardened
@@ -228,7 +255,8 @@ SQLite entity graph, fully offline.
   coverage enforced in CI (Node 22 + 24 matrix), typecheck and build gates,
   and an `npm audit` (high/critical) gate.
 
-[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.2...v0.1.3
