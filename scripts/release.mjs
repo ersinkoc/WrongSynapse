@@ -8,13 +8,15 @@
  * interactively instead: npm's browser/OTP prompt works in a real terminal.
  *
  * What it does:
- *   1. Pre-flight: git clean + master synced with origin, version free on
- *      the registry, tag matches HEAD, CHANGELOG has a version section.
+ *   1. Pre-flight: git clean, master synced with origin, version free on the
+ *      registry, tag v<version> exists AND points at HEAD, CHANGELOG has a
+ *      [version] section. (The tag must pre-exist and match HEAD — publish
+ *      packs the working tree, so a stale tag would ship a tarball the tag
+ *      cannot reproduce.)
  *   2. npm publish — the prepublishOnly guard (typecheck + tests + build)
  *      runs automatically before the pack; 2FA completes in this terminal.
- *   3. Tag the release and push it — only AFTER the registry confirms the
- *      published version, so a failed publish never leaves a stray tag.
- *   4. Verify: `npm view <name> version` must echo the released version.
+ *   3. Verify: retry `npm view <name> version` until the registry echoes the
+ *      released version, then push the tag (only after verified publish).
  *
  * Flags:
  *   --check    run pre-flight only (no publish, no tag) — read-only
