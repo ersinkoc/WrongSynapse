@@ -284,6 +284,65 @@ describe('route — memory list / get / delete', () => {
   });
 });
 
+describe('route — auth-token gating', () => {
+  // Dummy test fixtures (not real secrets); the header value is assembled
+  // dynamically so the file carries no literal credential-looking string.
+  const TOKEN = 'synapse-test-token';
+  const WRONG_SAME_LENGTH = 'synapse-test-tokeX';
+  const bearer = (t: string) => `Bearer ${t}`;
+  let authCtx: WebContext;
+
+  beforeEach(() => {
+    authCtx = { ...ctx, authToken: TOKEN };
+  });
+
+  it('DELETE is 401 without an Authorization header', () => {
+    const res = route({ method: 'DELETE', rawUrl: '/api/memory/m1' }, authCtx);
+    expect(res.status).toBe(401);
+  });
+
+  it('DELETE is 401 with the wrong token (same length, constant-time path)', () => {
+    const res = route(
+      { method: 'DELETE', rawUrl: '/api/memory/m1', authorization: bearer(WRONG_SAME_LENGTH) },
+      authCtx,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('DELETE is 401 with a wrong-length bearer token', () => {
+    const res = route(
+      { method: 'DELETE', rawUrl: '/api/memory/m1', authorization: bearer('short') },
+      authCtx,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('DELETE succeeds with the correct bearer token', () => {
+    insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:demo', name: 'm1' });
+    const res = route(
+      { method: 'DELETE', rawUrl: '/api/memory/m1', authorization: bearer(TOKEN) },
+      authCtx,
+    );
+    expect(res.status).toBe(200);
+    expect(jsonBody(res).body['deleted']).toBe(true);
+  });
+
+  it('DELETE succeeds with the correct raw (non-bearer) token', () => {
+    insertEntity(db, { id: 'm2', type: 'memory_entry', scopePath: 'proj:demo/file:src/x.ts', name: 'm2' });
+    const res = route(
+      { method: 'DELETE', rawUrl: '/api/memory/m2', authorization: TOKEN },
+      authCtx,
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it('read-only GET is not gated when a token is configured', () => {
+    insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:demo', name: 'm1' });
+    const res = route({ method: 'GET', rawUrl: '/api/memory/m1' }, authCtx);
+    expect(res.status).toBe(200);
+  });
+});
+
 describe('route — candidates', () => {
   beforeEach(() => {
     insertCandidate(db, { content: 'first observation', confidence: 0.6 });
@@ -324,6 +383,11 @@ describe('route — memory graph', () => {
     insertRelation(db, { sourceId: 'm1', targetId: 'f1', relation: 'ANCHORED_TO' });
     insertRelation(db, { sourceId: 'm2', targetId: 'f2', relation: 'ANCHORED_TO' });
     insertRelation(db, { sourceId: 'm3', targetId: 'm1', relation: 'SUPERSEDES' });
+    // Source-side neighbor: a commit whose INTRODUCED_BY_COMMIT edge points
+    // AT a memory — exercises the source branch of neighbor expansion
+    // (lines where sid is non-memory), mirroring the target-side f1/f2.
+    insertEntity(db, { id: 'c1', type: 'commit', scopePath: 'proj:a/commit:abc123', name: 'abc123' });
+    insertRelation(db, { sourceId: 'c1', targetId: 'm2', relation: 'INTRODUCED_BY_COMMIT' });
   });
 
   it('returns every memory_entry plus edges that touch them', () => {
@@ -332,11 +396,11 @@ describe('route — memory graph', () => {
     const nodes = body['nodes'] as Array<{ id: string; type: string }>;
     const edges = body['edges'] as Array<{ source: string; target: string; relation: string }>;
     const nodeIds = nodes.map((n) => n.id).sort();
-    expect(nodeIds).toEqual(['f1', 'f2', 'm1', 'm2', 'm3']);
+    expect(nodeIds).toEqual(['c1', 'f1', 'f2', 'm1', 'm2', 'm3']);
     expect(nodes.filter((n) => n.type === 'memory_entry')).toHaveLength(3);
-    expect(edges).toHaveLength(3);
+    expect(edges).toHaveLength(4);
     const rels = edges.map((e) => e.relation).sort();
-    expect(rels).toEqual(['ANCHORED_TO', 'ANCHORED_TO', 'SUPERSEDES']);
+    expect(rels).toEqual(['ANCHORED_TO', 'ANCHORED_TO', 'INTRODUCED_BY_COMMIT', 'SUPERSEDES']);
   });
 
   it('returns empty arrays when there are no memories', () => {
