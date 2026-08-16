@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-08-16
+
+Patch release: run-and-use out of the box — the embedding model now
+downloads itself on first use, and `--web-open` actually works on Windows.
+
+### Added
+
+- **Automatic one-time model download (run-and-use)** — the embedder's
+  default is now `auto`: model loads stay local-only, and on a cache miss
+  the ≈ 25 MB `Xenova/all-MiniLM-L6-v2` (q8) is downloaded exactly once
+  from the HuggingFace CDN into the per-user cache
+  (`~/.cache/wrongsynapse`), after which the process returns to local-only
+  for the rest of its lifetime. A fresh `npm install -g wrongsynapse &&
+  wrongsynapse --index .` (or `--demo`, or a web-UI search) now produces a
+  fully functional tri-hybrid index with no manual bootstrap. The mode is
+  resolved by the new exported `resolveRemoteMode()`: `auto` (default),
+  `allow` (`allowRemoteModels: true` / `SYNAPSE_ALLOW_REMOTE_MODEL=1`,
+  the legacy always-allow semantics), and `never`
+  (`noRemoteModels: true` / `--no-remote-model` /
+  `SYNAPSE_NO_REMOTE_MODEL=1`, strict offline — cache-only, no network
+  attempt, fast-fail with a clear message). An explicit
+  `allowRemoteModels: false` is honored as a deliberate offline opt-out,
+  preserving the pre-`auto` caller contract. Load-failure messages now
+  explain which mode failed and why. The CLI grows `--no-remote-model`,
+  and the test suite pins `SYNAPSE_NO_REMOTE_MODEL=1` for the real-model
+  subprocess test so CI never touches the network.
+
+### Fixed
+
+- **`--web-open` never worked on Windows** — the auto-open path spawned
+  `start` directly, but `start` is a `cmd.exe` builtin (not an `.exe`), so
+  the spawn always failed with ENOENT — silently, by design of the
+  best-effort path. Windows now goes through `cmd.exe /c start "" <url>`
+  (the empty title argument keeps `start` from swallowing the URL), while
+  macOS (`open`) and Linux (`xdg-open`) are unchanged.
+
 ## [0.1.7] — 2026-08-16
 
 Patch release: tri-hybrid retrieval with scores lands in the admin web UI,

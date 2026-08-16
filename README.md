@@ -23,7 +23,7 @@ The three channels are fused with **Reciprocal Rank Fusion (RRF, k = 60)** into 
 |---|---|
 | **Node.js** | ≥ 22 (22 and 24 tested in CI; `node:sqlite` fallback needs ≥ 22.5) |
 | **OS** | Windows, Linux, macOS (CI: `ubuntu-latest`; dev-verified on Windows) |
-| **Disk** | ≈ 25 MB for the embedding model (q8 ONNX, one-time download), then offline |
+| **Disk** | ≈ 25 MB for the embedding model (q8 ONNX — downloaded automatically on first use, then offline) |
 | **git** | optional — only for `--git` history linking |
 
 ## Optional admin web UI
@@ -107,21 +107,20 @@ against the admin panel):
 # install the published package
 npm install -g wrongsynapse
 
-# one-time model download (after this everything runs offline),
-# then index your workspace to populate ./synapse.db
-
-# PowerShell
-$env:SYNAPSE_ALLOW_REMOTE_MODEL = "1"
+# index your workspace to populate ./synapse.db — on the first run the
+# embedding model (≈ 25 MB) downloads automatically into ~/.cache/wrongsynapse;
+# after that one-time download everything runs offline
 wrongsynapse --index .
-Remove-Item Env:SYNAPSE_ALLOW_REMOTE_MODEL
-
-# bash / zsh
-SYNAPSE_ALLOW_REMOTE_MODEL=1 wrongsynapse --index .
-unset SYNAPSE_ALLOW_REMOTE_MODEL
 
 # start the MCP server (stdio by default)
 wrongsynapse
 ```
+
+Strict-offline hosts can forbid the download entirely: pass
+`--no-remote-model` (or set `SYNAPSE_NO_REMOTE_MODEL=1`) and WrongSynapse
+loads the model from the cache only — `SYNAPSE_MODEL_DIR` can point at a
+pre-provisioned model directory. `SYNAPSE_ALLOW_REMOTE_MODEL=1` keeps the
+older always-allow semantics for remote fetches.
 
 Prefer not to install globally? `npx wrongsynapse --index .` works the same (the one-time model download is cached per machine), or build from source:
 
@@ -230,7 +229,9 @@ wrongsynapse [options]
   --port <number>           SSE HTTP port (default: 8765, env SYNAPSE_PORT)
   --db <path>               SQLite database path (default ./synapse.db, env SYNAPSE_DB_PATH)
   --model-dir <dir>         Local embedding model directory (env SYNAPSE_MODEL_DIR)
-  --allow-remote-model      Allow one-time model download from the HF Hub (env SYNAPSE_ALLOW_REMOTE_MODEL=1)
+  --allow-remote-model      Always allow remote model fetches (env SYNAPSE_ALLOW_REMOTE_MODEL=1)
+  --no-remote-model         Strict offline: cache-only model loads, never download
+                            (env SYNAPSE_NO_REMOTE_MODEL=1)
   --index <workspace>       One-shot: index a workspace and exit (prints JSON stats)
   --git                     With --index: also link git commit history
   -h, --help                Show help
@@ -246,7 +247,8 @@ The database is closed cleanly on SIGINT/SIGTERM (server modes) and immediately 
 | `SYNAPSE_DB_PATH` | SQLite database path | `./synapse.db` |
 | `SYNAPSE_MODEL_DIR` | Directory with local model files (offline inference) | transformers cache |
 | `SYNAPSE_EMBEDDING_MODEL` | Embedding model id | `Xenova/all-MiniLM-L6-v2` |
-| `SYNAPSE_ALLOW_REMOTE_MODEL` | `1` to allow a **one-time** model download from the HF Hub | unset (offline) |
+| `SYNAPSE_ALLOW_REMOTE_MODEL` | `1` to always allow remote model fetches (the default already downloads once automatically) | unset (auto) |
+| `SYNAPSE_NO_REMOTE_MODEL` | `1` for strict offline — never download, cache-only | unset (auto) |
 | `SYNAPSE_PORT` | SSE HTTP port when `--port` is absent | `8765` |
 
 ---
@@ -355,8 +357,15 @@ src/
 ## Zero-cloud guarantee
 
 - Model weights live in the local transformers cache or `SYNAPSE_MODEL_DIR`.
-- With `SYNAPSE_ALLOW_REMOTE_MODEL` unset, remote fetching is refused at the transformers.js env level.
-- If the model is missing, indexing and querying **degrade gracefully**: structural + lexical retrieval keep working; semantic retrieval is skipped with a warning.
+- The **only** network WrongSynapse ever performs is the one-time, automatic
+  download of the embedding model (≈ 25 MB from the HuggingFace CDN) when the
+  cache is empty — afterwards every load is local and the process returns to
+  local-only mode. Set `SYNAPSE_NO_REMOTE_MODEL=1` (or `--no-remote-model`)
+  to forbid even that: remote fetching is then refused at the transformers.js
+  env level.
+- If the model is missing and cannot be downloaded, indexing and querying
+  **degrade gracefully**: structural + lexical retrieval keep working;
+  semantic retrieval is skipped with a warning.
 
 ## Security notes
 
