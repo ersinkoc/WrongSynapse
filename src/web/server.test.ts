@@ -466,12 +466,20 @@ describe('route — memory graph', () => {
     insertEntity(db, { id: 'b', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'twin', confidence: 0.9 });
     insertEntity(db, { id: 'fa', type: 'symbol', scopePath: 'proj:c/file:same.ts/sym:one', name: 'twin' });
     insertEntity(db, { id: 'fb', type: 'symbol', scopePath: 'proj:c/file:same.ts/sym:two', name: 'twin' });
+    // buildMemoryGraph only includes non-memory nodes that are endpoints of
+    // edges touching a selected memory — the twins must be related or they
+    // never enter the graph and the neighbor loop goes untested.
+    insertRelation(db, { sourceId: 'a', targetId: 'fa', relation: 'ANCHORED_TO' });
+    insertRelation(db, { sourceId: 'b', targetId: 'fb', relation: 'ANCHORED_TO' });
+    // Same scope as the twins but a DIFFERENT label: exercises the label
+    // arm of the content-identity sort comparator (scope_path tie-break).
+    insertEntity(db, { id: 'c', type: 'memory_entry', scopePath: 'proj:c/file:same.ts', name: 'alpha', confidence: 0.9 });
     const seededCtx = { ...ctx, layoutSeed: 7 };
     const res = route({ method: 'GET', rawUrl: '/api/graph/memory' }, seededCtx);
     const nodes = jsonBody(res).body['nodes'] as Array<{ id: string; position?: { x: number; y: number } }>;
-    expect(nodes).toHaveLength(4);
+    expect(nodes).toHaveLength(5);
     const coords = nodes.map((n) => `${n.position?.x}:${n.position?.y}`);
-    expect(new Set(coords).size).toBe(4); // all four distinct — both retries fired
+    expect(new Set(coords).size).toBe(5); // all distinct — both retries fired, 'c' placed too
     for (const n of nodes) expect(n.position).toBeDefined();
     // The twins sharing an rng stream must differ (one retried outward).
     const pa = nodes.find((n) => n.id === 'a')?.position;
