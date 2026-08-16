@@ -175,6 +175,7 @@ function MemoryRow(props: {
 }) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   return (
     <Box
@@ -238,6 +239,7 @@ function MemoryRow(props: {
                 disabled={busy}
                 onClick={() => {
                   setBusy(true);
+                  setError(null);
                   api
                     .deleteMemory(props.memory.id)
                     .then(() => {
@@ -246,14 +248,18 @@ function MemoryRow(props: {
                     })
                     .catch((err: unknown) => {
                       setBusy(false);
-                      // eslint-disable-next-line no-alert
-                      window.alert(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+                      setError(err instanceof Error ? err.message : String(err));
                     });
                 }}
               >
                 {busy ? <Spinner size="1" /> : 'Delete'}
               </Button>
             </Flex>
+            {error !== null && (
+              <Text size="1" color="red" mt="2">
+                Delete failed: {error}
+              </Text>
+            )}
           </Dialog.Content>
         </Dialog.Root>
       </Flex>
@@ -263,6 +269,7 @@ function MemoryRow(props: {
 
 function MemoryDetailPanel(props: { detail: MemoryDetail; onDeleted: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   return (
     <Flex direction="column" gap="3">
       <Flex align="center" justify="between">
@@ -276,6 +283,7 @@ function MemoryDetailPanel(props: { detail: MemoryDetail; onDeleted: () => void 
           disabled={busy}
           onClick={() => {
             setBusy(true);
+            setError(null);
             api
               .deleteMemory(props.detail.id)
               .then(() => {
@@ -283,13 +291,18 @@ function MemoryDetailPanel(props: { detail: MemoryDetail; onDeleted: () => void 
               })
               .catch((err: unknown) => {
                 setBusy(false);
-                window.alert(`Delete failed: ${err instanceof Error ? err.message : String(err)}`);
+                setError(err instanceof Error ? err.message : String(err));
               });
           }}
         >
           {busy ? <Spinner size="1" /> : 'Delete'}
         </Button>
       </Flex>
+      {error !== null && (
+        <Text size="1" color="red">
+          Delete failed: {error}
+        </Text>
+      )}
       <Box>
         <Text size="1" color="gray">
           Scope

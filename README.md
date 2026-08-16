@@ -324,7 +324,7 @@ db.close();
 
 ```bash
 npm run typecheck     # strict tsc, zero errors
-npm test              # 215 tests
+npm test              # 376 tests
 npm run test:coverage # 100% statement/branch/function/line gate (enforced in CI)
 npm run build         # tsc -> dist/ (ESM + .d.ts)
 npm publish --dry-run # prepublishOnly guard runs typecheck + test + build first
