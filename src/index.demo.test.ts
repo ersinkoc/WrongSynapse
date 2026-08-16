@@ -80,6 +80,8 @@ vi.mock('./engine/parser.js', () => ({
   })),
 }));
 vi.mock('./engine/demo.js', () => ({
+  DEFAULT_DEMO_INTERVAL_MS: 1000,
+  DEFAULT_DEMO_SEED: 42,
   DemoFeeder: class {
     constructor(options: { intervalMs?: number; seed?: number }) {
       mocks.demoOptions.push(options);

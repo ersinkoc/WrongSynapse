@@ -24,7 +24,7 @@ import { assertFts5, migrate } from './db/schema.js';
 import { dbStats } from './db/queries.js';
 import { getSharedEmbedder } from './engine/embedding.js';
 import { indexWorkspace } from './engine/parser.js';
-import { DemoFeeder } from './engine/demo.js';
+import { DemoFeeder, DEFAULT_DEMO_INTERVAL_MS, DEFAULT_DEMO_SEED } from './engine/demo.js';
 import { runSse, runStdio, SERVER_VERSION } from './mcp/server.js';
 import { TOOL_DEFINITIONS } from './mcp/tools/definitions.js';
 import { runWebServer, type WebServerHandle } from './web/server.js';
@@ -141,8 +141,8 @@ export function shouldStartDemo(cli: CliValues): boolean {
   return process.env['SYNAPSE_DEMO'] === '1';
 }
 
-/** Resolve the demo tick interval in ms (flag > env > default 1000). Invalid → default. */
-export function resolveDemoInterval(cli: CliValues, fallback = 1000): number {
+/** Resolve the demo tick interval in ms (flag > env > default). Invalid → default. */
+export function resolveDemoInterval(cli: CliValues, fallback: number = DEFAULT_DEMO_INTERVAL_MS): number {
   const raw = cli['demo-interval'] ?? process.env['SYNAPSE_DEMO_INTERVAL'];
   if (raw === undefined || raw === '') return fallback;
   const n = Number(raw);
@@ -150,8 +150,8 @@ export function resolveDemoInterval(cli: CliValues, fallback = 1000): number {
   return Math.floor(n);
 }
 
-/** Resolve the demo PRNG seed (flag > env > default 42). Invalid → default. */
-export function resolveDemoSeed(cli: CliValues, fallback = 42): number {
+/** Resolve the demo PRNG seed (flag > env > default). Invalid → default. */
+export function resolveDemoSeed(cli: CliValues, fallback: number = DEFAULT_DEMO_SEED): number {
   const raw = cli['demo-seed'] ?? process.env['SYNAPSE_DEMO_SEED'];
   if (raw === undefined || raw === '') return fallback;
   const n = Number(raw);
@@ -322,7 +322,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     // The SSE branch genuinely awaits server shutdown (the 'close' event
     // fires only after every connection ended), so closing the DB here is
     // safe. Null the globals first: a later signal would otherwise re-close them.
-    demo?.stop();
+    await demo?.stop();
     activeDemo = null;
     if (web !== null) await web.close();
     activeWeb = null;
@@ -348,24 +348,33 @@ let activeWeb: WebServerHandle | null = null;
 /** The live demo feeder for the CLI process (for signal-driven shutdown). */
 let activeDemo: DemoFeeder | null = null;
 
-/** Close the live demo feeder + web server + DB and exit (SIGINT/SIGTERM); installed only in the entry-point branch. */
-function shutdown(): void {
-  try {
-    activeDemo?.stop();
-  } catch {
-    // best-effort stop on exit
-  }
-  try {
-    void activeWeb?.close();
-  } catch {
-    // best-effort close on exit
-  }
-  try {
-    activeDb?.close();
-  } catch {
-    // best-effort close on exit
-  }
-  process.exit(0);
+/** The in-progress teardown, if any (re-entry guard for stacked signals). */
+let shutdownPromise: Promise<void> | null = null;
+
+/** Stop the live demo feeder + web server + close the DB and exit (SIGINT/SIGTERM); installed only in the entry-point branch. */
+function shutdown(): Promise<void> {
+  // Re-entry guard: a second signal arriving while the first teardown is
+  // still awaiting the in-flight demo tick must await the SAME teardown —
+  // a parallel run would close the DB under the still-running tick.
+  shutdownPromise ??= (async () => {
+    try {
+      await activeDemo?.stop();
+    } catch {
+      // best-effort stop on exit
+    }
+    try {
+      void activeWeb?.close();
+    } catch {
+      // best-effort close on exit
+    }
+    try {
+      activeDb?.close();
+    } catch {
+      // best-effort close on exit
+    }
+    process.exit(0);
+  })();
+  return shutdownPromise;
 }
 
 /**

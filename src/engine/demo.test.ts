@@ -204,7 +204,7 @@ describe('DemoFeeder', () => {
     expect(stats.promoted).toBe(promoted.length);
   });
 
-  it('start/stop lifecycle: idempotent, scheduler receives the interval, stop logs totals', () => {
+  it('start/stop lifecycle: idempotent, scheduler receives the interval, stop logs totals', async () => {
     const db = sharedDb();
     const intervals: number[] = [];
     const cancels = vi.fn();
@@ -224,8 +224,8 @@ describe('DemoFeeder', () => {
     feeder.start(); // idempotent
     expect(feeder.running).toBe(true);
     expect(intervals).toEqual([250]);
-    feeder.stop();
-    feeder.stop(); // idempotent
+    await feeder.stop();
+    await feeder.stop(); // idempotent
     expect(feeder.running).toBe(false);
     expect(cancels).toHaveBeenCalledTimes(1);
     expect(lines.some((l) => l.includes('streaming observations every 250ms'))).toBe(true);

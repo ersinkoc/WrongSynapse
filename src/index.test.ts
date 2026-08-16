@@ -371,7 +371,9 @@ describe('entry-point auto-run branch (module re-import)', () => {
       const firstResult = mocks.openDatabase.mock.results[0];
       expect(firstResult, 'main() must have opened the database').toBeDefined();
       const dbHandle = (await firstResult!.value) as { close: ReturnType<typeof vi.fn> };
-      handler!();
+      // shutdown() is async (awaits the in-flight demo tick before exit) —
+      // awaiting the returned promise keeps the exit assertion race-free.
+      await handler!();
       expect(dbHandle.close).toHaveBeenCalledTimes(1);
       expect(exit).toHaveBeenCalledWith(0);
       const closeOrder = dbHandle.close.mock.invocationCallOrder[0];
@@ -416,7 +418,7 @@ describe('entry-point auto-run branch (module re-import)', () => {
       vi.resetModules();
       await import('./index.js');
       expect(sigintHandler).toBeDefined();
-      sigintHandler!();
+      await sigintHandler!();
       expect(exit).toHaveBeenCalledWith(0);
     } finally {
       exit.mockRestore();
@@ -435,7 +437,7 @@ describe('entry-point auto-run branch (module re-import)', () => {
       vi.resetModules();
       await import('./index.js');
       await vi.waitFor(() => expect(mocks.runStdio).toHaveBeenCalledTimes(1), { timeout: 1000 });
-      sigintHandler!();
+      await sigintHandler!();
       expect(exit).toHaveBeenCalledWith(0); // best-effort close, still exits
     } finally {
       exit.mockRestore();

@@ -34,6 +34,7 @@ import type { Embedder } from './embedding.js';
 
 export const DEFAULT_DEMO_INTERVAL_MS = 1000;
 export const DEFAULT_DEMO_SCOPE_PREFIX = 'proj:demo';
+export const DEFAULT_DEMO_SEED = 42;
 
 /** Promote when confidence is at or above this; discard otherwise. */
 export const DEMO_PROMOTE_THRESHOLD = 0.75;
@@ -120,6 +121,7 @@ export class DemoFeeder {
   readonly #rng: () => number;
   #anchors: DemoAnchor[] = [];
   #cancel: (() => void) | null = null;
+  #inFlight: Promise<void> | null = null;
   #tickCount = 0;
   #promoted = 0;
   #discarded = 0;
@@ -148,15 +150,25 @@ export class DemoFeeder {
     this.ensureScaffold();
     this.#log(`WrongSynapse demo mode: streaming observations every ${this.#intervalMs}ms into ${this.#scopePrefix}/...`);
     this.#cancel = this.#scheduler(() => {
-      void this.tick();
+      this.#inFlight = this.tick();
     }, this.#intervalMs);
   }
 
-  /** Stop streaming. Idempotent. */
-  stop(): void {
+  /**
+   * Stop streaming and await any in-flight tick. Idempotent.
+   * Async by design: a synchronous stop could return while a scheduled
+   * tick is still writing to the DB — a caller that then closes the DB
+   * would race the tick into "database closed" errors. Awaiting the
+   * in-flight promise guarantees quiescence before teardown continues.
+   */
+  async stop(): Promise<void> {
     if (this.#cancel === null) return;
     this.#cancel();
     this.#cancel = null;
+    if (this.#inFlight !== null) {
+      await this.#inFlight;
+      this.#inFlight = null;
+    }
     this.#log(`WrongSynapse demo mode stopped (${this.#tickCount} ticks, ${this.#promoted} promoted, ${this.#discarded} discarded).`);
   }
 

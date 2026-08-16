@@ -287,6 +287,7 @@ import {
   hybridSearch,                   // tri-hybrid RRF retrieval
   parseScope, scopeMatchesAnyPrefix, // scope URI helpers
   dbStats,
+  DemoFeeder,                     // continuous synthetic ingestion (demo mode)
 } from 'wrongsynapse';
 
 const db = await openDatabase('./synapse.db');
@@ -304,6 +305,14 @@ const { results } = await hybridSearch(db, embedder, {
   scopes: ['proj:app/file:src'],
   limit: 5,
 });
+
+// DemoFeeder drives the same lifecycle programmatically (returns a Promise —
+// await feeder.stop() before closing the DB; it waits out any in-flight tick).
+const feeder = new DemoFeeder({ db, embedder, intervalMs: 1000, seed: 42 });
+feeder.start();
+// ... later:
+await feeder.stop();
+db.close();
 ```
 
 ## Development
