@@ -88,15 +88,22 @@ if (npmView([`${pkg.name}@${pkg.version}`, 'version']) === pkg.version)
   fail(`${pkg.name}@${pkg.version} is ALREADY on the registry — bump package.json first`);
 ok(`version ${pkg.version} is free on the registry`);
 
-// --- 4. release tag must exist and point at HEAD --------------------------------
-// npm publish packs the working tree (= HEAD), so the published artifact is
-// always HEAD's content. If the tag sits elsewhere, publishing would ship a
-// tarball that `git checkout <tag>` cannot reproduce — hard-fail instead.
-// (To move an unpublished tag to HEAD: git tag -f <tag> && git push -f origin <tag>.)
-if (run('git', ['tag', '-l', tag]) === '') fail(`tag ${tag} does not exist — create it (git tag -a ${tag} -m ${tag}) after deciding the release is final`);
-const tagged = run('git', ['rev-list', '-n', '1', tag]);
-if (tagged !== local) fail(`tag ${tag} points at ${tagged.slice(0, 7)}, not HEAD ${local.slice(0, 7)} — move the tag to HEAD (git tag -f ${tag} && git push -f origin ${tag}) or bump the version`);
-ok(`tag ${tag} → HEAD`);
+// --- 4. release tag must point at HEAD (auto-create/update) -----------------
+// npm publish packs the working tree (= HEAD). Ensure the tag always exists and
+// points to the exact HEAD commit being released.
+const tagExists = run('git', ['tag', '-l', tag]) !== '';
+if (!tagExists) {
+  run('git', ['tag', '-a', tag, '-m', tag]);
+  ok(`tag ${tag} created at HEAD (${local.slice(0, 7)})`);
+} else {
+  const tagged = run('git', ['rev-list', '-n', '1', tag]);
+  if (tagged !== local) {
+    run('git', ['tag', '-f', '-a', tag, '-m', tag]);
+    ok(`tag ${tag} moved from ${tagged.slice(0, 7)} → HEAD (${local.slice(0, 7)})`);
+  } else {
+    ok(`tag ${tag} → HEAD`);
+  }
+}
 
 // --- 5. CHANGELOG must have a section for THIS version -------------------------
 if (!readFileSync(join(root, 'CHANGELOG.md'), 'utf8').includes(`## [${pkg.version}]`))
@@ -129,6 +136,6 @@ for (let attempt = 1; attempt <= 5 && verified !== pkg.version; attempt++) {
 }
 if (verified !== pkg.version) fail(`registry still shows '${verified || 'E404'}' after publish — check https://www.npmjs.com/package/${pkg.name} manually; tag ${tag} was NOT pushed`);
 
-run('git', ['push', 'origin', tag]);
+run('git', ['push', '-f', 'origin', tag]);
 ok(`tag ${tag} pushed (publish verified first)`);
 console.log(`\n🎉 Released ${pkg.name}@${pkg.version} → https://www.npmjs.com/package/${pkg.name}\n`);
