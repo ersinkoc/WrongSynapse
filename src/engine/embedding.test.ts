@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => {
     allowRemoteModels: false,
     allowLocalModels: true,
     localModelPath: undefined as string | undefined,
+    cacheDir: undefined as string | undefined,
   };
   const pipelineMock = vi.fn();
   return { envMock, pipelineMock };
@@ -51,6 +52,7 @@ describe('createEmbedder / configuration', () => {
   beforeEach(() => {
     envMock.allowRemoteModels = false;
     envMock.localModelPath = undefined;
+    envMock.cacheDir = undefined;
     pipelineMock.mockReset();
   });
   afterEach(() => {
@@ -60,8 +62,9 @@ describe('createEmbedder / configuration', () => {
   it('applies constructor options to the transformers env', () => {
     createEmbedder({ modelId: 'custom/model', allowRemoteModels: true, localModelDir: '/tmp/models' });
     expect(envMock.allowRemoteModels).toBe(true);
-    // localModelPath is resolved to an absolute path by the embedder
+    // localModelPath/cacheDir are resolved to absolute paths by the embedder
     expect(envMock.localModelPath).toBe(resolve('/tmp/models'));
+    expect(envMock.cacheDir).toBe(resolve('/tmp/models'));
   });
 
   it('defaults to the canonical model id', () => {
@@ -80,19 +83,22 @@ describe('createEmbedder / configuration', () => {
     expect(embedder.modelId).toBe('env/model');
     expect(envMock.allowRemoteModels).toBe(true);
     expect(envMock.localModelPath).toBe(resolve('/tmp/env-models'));
+    expect(envMock.cacheDir).toBe(resolve('/tmp/env-models'));
   });
 
   it('defaults the model cache to a per-user directory when no model dir is given', () => {
-    // Global installs: transformers.js would otherwise cache inside the
-    // global install tree. Both home vars stubbed identically so the test
-    // is deterministic on Windows (USERPROFILE) and POSIX (HOME). Ambient
-    // SYNAPSE_MODEL_DIR is deleted so the default branch is truly reached
-    // even when the dev box exports it.
+    // Global installs: transformers.js would otherwise root its download
+    // cache (env.cacheDir) and local-model read path (env.localModelPath)
+    // inside the global install tree. Both home vars stubbed identically so
+    // the test is deterministic on Windows (USERPROFILE) and POSIX (HOME).
+    // Ambient SYNAPSE_MODEL_DIR is deleted so the default branch is truly
+    // reached even when the dev box exports it.
     vi.stubEnv('SYNAPSE_MODEL_DIR', undefined);
     vi.stubEnv('HOME', '/home/agent');
     vi.stubEnv('USERPROFILE', '/home/agent');
     createEmbedder();
     expect(envMock.localModelPath).toBe(resolve('/home/agent', '.cache', 'wrongsynapse'));
+    expect(envMock.cacheDir).toBe(resolve('/home/agent', '.cache', 'wrongsynapse'));
   });
 
   it('falls back to a local .cache when no home directory is known', () => {
@@ -102,6 +108,7 @@ describe('createEmbedder / configuration', () => {
     vi.stubEnv('USERPROFILE', undefined);
     createEmbedder();
     expect(envMock.localModelPath).toBe(resolve('./.cache'));
+    expect(envMock.cacheDir).toBe(resolve('./.cache'));
   });
 });
 
