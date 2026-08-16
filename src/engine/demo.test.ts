@@ -417,7 +417,13 @@ describe('DemoFeeder', () => {
     const stopped = feeder.stop().then(() => {
       stoppedDone = true;
     });
-    await new Promise((resolveGrace) => setTimeout(resolveGrace, 10));
+    // Deterministic tidemark: several macrotask hops let every pending
+    // callback/microtask that COULD settle `stopped` run. No wall-clock
+    // timer — the gate is still closed, so if stop() respects quiescence,
+    // `stopped` cannot resolve here no matter how slow the host is.
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolveHop) => setImmediate(resolveHop));
+    }
     expect(stoppedDone).toBe(false); // still draining the in-flight tick
     releaseEmbed!();
     await stopped;
