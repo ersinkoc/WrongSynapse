@@ -27,8 +27,11 @@ import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-// Windows: npm is an .cmd shim — spawning bare 'npm' throws ENOENT.
-const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+// Windows: npm is a .cmd shim. Spawning it directly breaks stdio capture
+// (stderr comes back empty on failure, defeating E404 detection), so npm
+// goes through the shell on win32; args here are simple tokens, safe to join.
+const NPM = 'npm';
+const winShell = process.platform === 'win32' ? { shell: true } : {};
 
 /** Run a command, capture stdout; throw with context on failure. */
 function run(cmd, args) {
@@ -43,7 +46,7 @@ function run(cmd, args) {
 /** Registry lookup that returns '' only for a confirmed E404 (not published). */
 function npmView(args) {
   try {
-    return execFileSync(NPM, ['view', ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    return execFileSync(NPM, ['view', ...args], { cwd: root, encoding: 'utf8', ...winShell, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   } catch (err) {
     const stderr = String(err.stderr ?? '');
     if (stderr.includes('E404')) return ''; // version/package not on registry — expected pre-release
@@ -79,13 +82,14 @@ if (npmView([`${pkg.name}@${pkg.version}`, 'version']) === pkg.version)
   fail(`${pkg.name}@${pkg.version} is ALREADY on the registry — bump package.json first`);
 ok(`version ${pkg.version} is free on the registry`);
 
-// --- 4. release tag must already exist and point at HEAD ----------------------
-// A tag created before publish would advertise a version that may never
-// reach the registry (test/build/2FA failure), so we refuse to create it
-// here; tag and push happen only after verified publication in step 7.
+// --- 4. release tag must exist and point at HEAD --------------------------------
+// npm publish packs the working tree (= HEAD), so the published artifact is
+// always HEAD's content. If the tag sits elsewhere, publishing would ship a
+// tarball that `git checkout <tag>` cannot reproduce — hard-fail instead.
+// (To move an unpublished tag to HEAD: git tag -f <tag> && git push -f origin <tag>.)
 if (run('git', ['tag', '-l', tag]) === '') fail(`tag ${tag} does not exist — create it (git tag -a ${tag} -m ${tag}) after deciding the release is final`);
 const tagged = run('git', ['rev-list', '-n', '1', tag]);
-if (tagged !== local) fail(`tag ${tag} points at ${tagged.slice(0, 7)}, not HEAD ${local.slice(0, 7)}`);
+if (tagged !== local) fail(`tag ${tag} points at ${tagged.slice(0, 7)}, not HEAD ${local.slice(0, 7)} — move the tag to HEAD (git tag -f ${tag} && git push -f origin ${tag}) or bump the version`);
 ok(`tag ${tag} → HEAD`);
 
 // --- 5. CHANGELOG must have a section for THIS version -------------------------
@@ -99,7 +103,7 @@ if (checkOnly) { console.log('\nPre-flight OK — publish with: npm run release\
 console.log(`\nPublishing ${pkg.name}@${pkg.version} — prepublishOnly guard will run typecheck + tests + build first.`);
 console.log('Complete the 2FA prompt (browser or OTP) when it appears.\n');
 try {
-  execFileSync(NPM, ['publish', ...(otpArg ? [otpArg] : [])], { cwd: root, stdio: 'inherit' });
+  execFileSync(NPM, ['publish', ...(otpArg ? [otpArg] : [])], { cwd: root, ...winShell, stdio: 'inherit' });
 } catch {
   fail('npm publish failed (see output above). If it was EOTP, re-run: npm run release -- --otp=<6-digit code>');
 }
@@ -107,7 +111,14 @@ try {
 // --- 7. verify on the registry, THEN push the tag -------------------------------
 let verified = '';
 for (let attempt = 1; attempt <= 5 && verified !== pkg.version; attempt++) {
-  verified = npmView([pkg.name, 'version']); // '' only on E404
+  try {
+    verified = npmView([pkg.name, 'version']); // '' only on confirmed E404
+  } catch (err) {
+    // Transient registry/network error right after a SUCCESSFUL publish:
+    // retry instead of crashing (a crash here would skip the tag push).
+    console.warn(`! registry check ${attempt}/5 failed (${String(err.message).split('\n')[0]}) — retrying`);
+    verified = '';
+  }
   if (verified !== pkg.version) await new Promise((r) => setTimeout(r, 3000));
 }
 if (verified !== pkg.version) fail(`registry still shows '${verified || 'E404'}' after publish — check https://www.npmjs.com/package/${pkg.name} manually; tag ${tag} was NOT pushed`);
