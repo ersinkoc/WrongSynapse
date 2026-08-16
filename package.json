@@ -39,7 +39,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "release": "node scripts/release.mjs",
+    "release:check": "node scripts/release.mjs --check"
   },
   "keywords": [
     "mcp",
