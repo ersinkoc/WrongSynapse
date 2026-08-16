@@ -31,7 +31,9 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 // Windows: npm is a .cmd shim. Spawning it directly breaks stdio capture
 // (stderr comes back empty on failure, defeating E404 detection), so npm
-// goes through the shell on win32; args here are simple tokens, safe to join.
+// goes through the shell on win32; args here are simple tokens passed as
+// an array, and execFileSync handles shell escaping so no manual joining
+// is needed.
 const NPM = 'npm';
 const winShell = process.platform === 'win32' ? { shell: true } : {};
 
