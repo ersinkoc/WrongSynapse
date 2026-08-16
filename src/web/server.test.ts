@@ -451,10 +451,12 @@ function httpRequest(
   path: string,
   method: 'GET' | 'DELETE' | 'POST' = 'GET',
   body?: string,
+  authorization?: string,
 ): Promise<{ status: number; body: string; headers: Record<string, string | string[] | undefined> }> {
   return new Promise((resolveRequest, rejectRequest) => {
     const headers: Record<string, string> = {};
     if (body !== undefined) headers['content-type'] = 'application/json';
+    if (authorization !== undefined) headers['authorization'] = authorization;
     const req = http.request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (c) => chunks.push(c));
@@ -510,8 +512,8 @@ describe('runWebServer (HTTP shell)', () => {
   });
 
   it('DELETE /api/memory/:id over real HTTP cascades', async () => {
-    insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:a', name: 'm1' });
-    insertEntity(db, { id: 'f1', type: 'file', scopePath: 'proj:b', name: 'f1' });
+    insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:x', name: 'm1' });
+    insertEntity(db, { id: 'f1', type: 'file', scopePath: 'proj:x/file:x.ts', name: 'x.ts' });
     insertRelation(db, { sourceId: 'm1', targetId: 'f1', relation: 'ANCHORED_TO' });
     const handle = await runWebServer({ db, staticDir: httpShellDir }, 0);
     try {
@@ -519,6 +521,27 @@ describe('runWebServer (HTTP shell)', () => {
       const res = await httpRequest(port, '/api/memory/m1', 'DELETE');
       expect(res.status).toBe(200);
       expect(JSON.parse(res.body)['deleted']).toBe(true);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('auth token flows through the real HTTP shell (401 vs 200)', async () => {
+    // The route()-level suite covers isAuthorized(); this exercises the
+    // production path end-to-end: header read by the HTTP shell, forwarded
+    // to route(), enforced on DELETE. WebContext.authToken drives it.
+    const TOKEN = 'synapse-http-shell-token';
+    insertEntity(db, { id: 'm1', type: 'memory_entry', scopePath: 'proj:x', name: 'm1' });
+    const handle = await runWebServer({ db, staticDir: httpShellDir, authToken: TOKEN }, 0);
+    try {
+      const port = (handle.server.address() as AddressInfo).port;
+      const denied = await httpRequest(port, '/api/memory/m1', 'DELETE');
+      expect(denied.status).toBe(401);
+      const wrong = await httpRequest(port, '/api/memory/m1', 'DELETE', undefined, `Bearer ${TOKEN}X`);
+      expect(wrong.status).toBe(401);
+      const allowed = await httpRequest(port, '/api/memory/m1', 'DELETE', undefined, `Bearer ${TOKEN}`);
+      expect(allowed.status).toBe(200);
+      expect(JSON.parse(allowed.body)['deleted']).toBe(true);
     } finally {
       await handle.close();
     }

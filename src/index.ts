@@ -148,6 +148,9 @@ async function maybeOpenBrowser(url: string): Promise<void> {
     // 'error' event. A no-op listener routes that into the void; `unref()`
     // keeps the (potentially-orphaned) child from blocking event-loop exit.
     const child = cp.spawn(cmd, [url], { detached: true, stdio: 'ignore' });
+    /* v8 ignore next -- OS-specific: fires only when the spawned opener dies
+       asynchronously (no xdg-open on headless CI); the win32 `start` arm
+       exercises it in local runs but not on the linux coverage host. */
     child.on('error', () => undefined);
     child.unref();
   } catch {
