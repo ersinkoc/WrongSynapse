@@ -150,7 +150,15 @@ export class DemoFeeder {
     this.ensureScaffold();
     this.#log(`WrongSynapse demo mode: streaming observations every ${this.#intervalMs}ms into ${this.#scopePrefix}/...`);
     this.#cancel = this.#scheduler(() => {
+      // Skip-if-busy: demo ticks are droppable. Blindly overwriting
+      // #inFlight here would orphan a still-running slow tick (e.g. a
+      // long embed) — stop() would then await only the newest reference
+      // while the orphan kept writing, racing the DB close.
+      if (this.#inFlight !== null) return;
       this.#inFlight = this.tick();
+      void this.#inFlight.then(() => {
+        this.#inFlight = null;
+      });
     }, this.#intervalMs);
   }
 
@@ -211,9 +219,17 @@ export class DemoFeeder {
     }
   }
 
-  /** Decide over the pending batch: promote keepers, discard noise. */
+  /** Decide over the pending batch: promote keepers, discard noise. Demo-owned rows only. */
   async #consolidate(): Promise<void> {
-    const pending = listCandidates(this.#db, { status: 'pending', limit: CONSOLIDATION_BATCH });
+    // Ownership filter (extractedFrom: 'demo'): when the user points --demo
+    // at a real database via --db, this sweep must decide ONLY over rows the
+    // feeder wrote — foreign pending candidates stay untouched no matter
+    // their confidence.
+    const pending = listCandidates(this.#db, {
+      status: 'pending',
+      limit: CONSOLIDATION_BATCH,
+      extractedFrom: 'demo',
+    });
     for (const candidate of pending) {
       if (decideConsolidation(candidate) === 'promote') {
         await this.#promote(candidate);

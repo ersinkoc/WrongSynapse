@@ -36,11 +36,11 @@ Patch release: fix web UI frontend build errors, align web API versioning, preve
 
 - **SPA static directory resolution** — passed `spaDir` directly into `runWebServer` in `src/index.ts` while preserving 100% test branch coverage.
 
+## [0.1.3] — 2026-08-16
+
 Patch release: the 0.1.2 tarball shipped docs for the admin web UI but not
 its code, and `--version` printed a hardcoded 0.1.0. This release ships the
 real thing.
-
-## [0.1.3] — 2026-08-16
 
 ### Added
 

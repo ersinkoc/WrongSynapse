@@ -297,14 +297,14 @@ describe('DemoFeeder', () => {
     }
   }, 10_000);
 
-  it('consolidates pre-existing pending candidates: null scope anchors to the project, missing target skips the edge', async () => {
+  it('consolidates pre-existing demo-owned candidates: null scope anchors to the project, missing target skips the edge', async () => {
     const db = sharedDb();
     const { feeder } = makeFeeder(db, { seed: 3 });
     feeder.ensureScaffold();
-    // Pre-date the feeder: one candidate with no scope, one aimed at a
-    // scope that has no structural entity behind it.
-    insertCandidate(db, { content: 'legacy note without a scope', confidence: 0.9 });
-    insertCandidate(db, { content: 'note aimed at a ghost file', confidence: 0.9, scopePath: 'proj:demo/file:ghost.ts' });
+    // Pre-date the feeder with DEMO-OWNED rows (extractedFrom: 'demo') —
+    // one with no scope, one aimed at a scope with no structural entity.
+    insertCandidate(db, { content: 'legacy note without a scope', confidence: 0.9, extractedFrom: 'demo' });
+    insertCandidate(db, { content: 'note aimed at a ghost file', confidence: 0.9, extractedFrom: 'demo', scopePath: 'proj:demo/file:ghost.ts' });
     for (let i = 0; i < DEMO_CONSOLIDATE_EVERY; i += 1) {
       await feeder.tick();
     }
@@ -317,6 +317,33 @@ describe('DemoFeeder', () => {
     // the project scope, the ghost one simply has no ANCHORED_TO edge.
     expect(getEntityByScope(db, 'proj:demo', ['memory_entry'])).toBeDefined();
     expect(getEntityByScope(db, 'proj:demo/file:ghost.ts', ['memory_entry'])).toBeDefined();
+  });
+
+  it('never touches foreign pending candidates (ownership filter — --db escape-hatch safety)', async () => {
+    const db = sharedDb();
+    const { feeder } = makeFeeder(db, { seed: 5 });
+    feeder.ensureScaffold();
+    // Foreign rows: a user observation via the MCP tool and one with no
+    // source at all. Both have high confidence — the sweep would promote
+    // them if the ownership filter were missing — and one low-confidence
+    // row that would be discarded. All must stay untouched.
+    insertCandidate(db, { content: 'user observation via mcp', confidence: 0.95, extractedFrom: 'mcp:synapse_record_observation' });
+    insertCandidate(db, { content: 'unattributed user note', confidence: 0.95 });
+    insertCandidate(db, { content: 'another unattributed note', confidence: 0.3 });
+    for (let i = 0; i < DEMO_CONSOLIDATE_EVERY * 2; i += 1) {
+      await feeder.tick();
+    }
+    const all = listCandidates(db, { limit: 50 });
+    const user1 = all.find((c) => c.content === 'user observation via mcp');
+    const user2 = all.find((c) => c.content === 'unattributed user note');
+    const user3 = all.find((c) => c.content === 'another unattributed note');
+    expect(user1?.status).toBe('pending');
+    expect(user2?.status).toBe('pending');
+    expect(user3?.status).toBe('pending');
+    // ...while the feeder's own rows were decided as usual.
+    const demoRows = all.filter((c) => c.extractedFrom === 'demo');
+    expect(demoRows.length).toBeGreaterThan(0);
+    expect(demoRows.every((c) => c.status !== 'pending')).toBe(true);
   });
 
   it('logs non-Error throw values from a tick without crashing', async () => {
@@ -348,6 +375,56 @@ describe('DemoFeeder', () => {
     const file = getEntityByScope(db, 'proj:demo/file:src/db/queries.ts', ['file']);
     expect(file?.id).toBe('pre-file');
   });
+
+  it('stop() drains an in-flight consolidation before returning (quiescence)', async () => {
+    const db = sharedDb();
+    let releaseEmbed: (() => void) | undefined;
+    const embedGate = new Promise<void>((resolveGate) => {
+      releaseEmbed = resolveGate;
+    });
+    const embedder = {
+      modelId: 'test', dimension: 8, isReady: () => true,
+      init: async () => undefined,
+      embed: async () => {
+        await embedGate; // park the 5th tick's consolidation mid-promote
+        return new Float32Array(8).fill(0.5);
+      },
+      embedBatch: async () => [new Float32Array(8)],
+    };
+    let scheduled: (() => void) | undefined;
+    const feeder = new DemoFeeder({
+      db,
+      embedder,
+      logger: () => undefined,
+      scheduler: (cb: () => void) => {
+        scheduled = cb;
+        return () => undefined;
+      },
+      seed: 3,
+    });
+    feeder.start();
+    // Drive ticks manually; a macrotask hop between ticks lets each promise
+    // fully settle so the skip-if-busy guard never drops one.
+    for (let i = 0; i < DEMO_CONSOLIDATE_EVERY; i += 1) {
+      scheduled!();
+      await new Promise((resolveTick) => setTimeout(resolveTick, 0));
+    }
+    // Tick #5 is parked on the embed gate — firing the scheduler again
+    // must hit the skip-if-busy guard (droppable tick), NOT start a sixth.
+    scheduled!();
+    // stop() must await the still-in-flight tick.
+    let stoppedDone = false;
+    const stopped = feeder.stop().then(() => {
+      stoppedDone = true;
+    });
+    await new Promise((resolveGrace) => setTimeout(resolveGrace, 10));
+    expect(stoppedDone).toBe(false); // still draining the in-flight tick
+    releaseEmbed!();
+    await stopped;
+    expect(stoppedDone).toBe(true);
+    // The guarded extra fire never became a sixth tick.
+    expect(feeder.stats.ticks).toBe(DEMO_CONSOLIDATE_EVERY);
+  }, 10_000);
 
   it('stringifies a bare thrown string from a tick (non-Error arm)', async () => {
     const lines: string[] = [];

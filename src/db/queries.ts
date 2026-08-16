@@ -544,13 +544,25 @@ export function setCandidateStatus(db: SynapseDatabase, id: string, status: 'pen
 
 export function listCandidates(
   db: SynapseDatabase,
-  options: { status?: string; limit?: number } = {},
+  options: { status?: string; limit?: number; extractedFrom?: string } = {},
 ): CandidateRow[] {
-  const { status, limit = 50 } = options;
-  const rows =
-    status === undefined
-      ? db.prepare('SELECT * FROM memory_candidates ORDER BY created_at DESC LIMIT ?').all(limit)
-      : db.prepare('SELECT * FROM memory_candidates WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
+  const { status, limit = 50, extractedFrom } = options;
+  const clauses: string[] = [];
+  const params: SqlValue[] = [];
+  if (status !== undefined) {
+    clauses.push('status = ?');
+    params.push(status);
+  }
+  if (extractedFrom !== undefined) {
+    // Ownership filter: a synthetic writer (e.g. DemoFeeder) must only
+    // sweep candidates it created, never foreign rows sharing the pool.
+    clauses.push('extracted_from = ?');
+    params.push(extractedFrom);
+  }
+  const where = clauses.length > 0 ? ` WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db
+    .prepare(`SELECT * FROM memory_candidates${where} ORDER BY created_at DESC LIMIT ?`)
+    .all(...params, limit);
   return rows.map(candidateFromRow);
 }
 

@@ -3,9 +3,12 @@
  *
  * Covers the pure helpers exported from src/index.ts (shouldStartDemo,
  * resolveDemoInterval, resolveDemoSeed) with the same flag > env > default
- * semantics as the web helpers, plus an integration-style test that boots
- * main() with --demo and verifies the feeder starts against the isolated
- * synapse-demo.db default and stops on process signals.
+ * semantics as the web helpers, plus integration-style tests that boot
+ * main() with --demo: the feeder starts with flag-resolved interval/seed
+ * against the isolated synapse-demo.db default, stays off without --demo,
+ * is demoted under one-shot --index, and stops when the SSE server closes.
+ * Signal-driven teardown (SIGINT/SIGTERM) is covered by the entry-point
+ * lifecycle tests in src/index.test.ts.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -60,6 +63,16 @@ vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase }));
 vi.mock('./db/schema.js', () => ({ migrate: mocks.migrate, assertFts5: mocks.assertFts5 }));
 vi.mock('./db/queries.js', () => ({
   dbStats: vi.fn(() => ({ entities: 0, relations: 0, vectors: 0, candidates: 0, ftsRows: 0 })),
+  // Stubs for every VALUE the real src/engine/demo.ts imports — the partial
+  // mock of ./engine/demo.js (importOriginal below) resolves through here,
+  // so missing exports would throw at binding time.
+  getEntityByScope: vi.fn(() => undefined),
+  insertCandidate: vi.fn(() => 'stub-id'),
+  insertEntity: vi.fn(() => true),
+  insertRelation: vi.fn(),
+  listCandidates: vi.fn(() => []),
+  setCandidateStatus: vi.fn(),
+  upsertVector: vi.fn(),
 }));
 vi.mock('./engine/embedding.js', () => ({ getSharedEmbedder: mocks.getSharedEmbedder }));
 vi.mock('./engine/parser.js', () => ({
@@ -79,9 +92,11 @@ vi.mock('./engine/parser.js', () => ({
     warnings: [],
   })),
 }));
-vi.mock('./engine/demo.js', () => ({
-  DEFAULT_DEMO_INTERVAL_MS: 1000,
-  DEFAULT_DEMO_SEED: 42,
+vi.mock('./engine/demo.js', async (importOriginal) => ({
+  // Partial mock: the REAL constants flow through (changing a default in
+  // src/engine/demo.ts must fail these tests, not silently keep passing
+  // with a stale mirror); only the class is replaced with a capture stub.
+  ...(await importOriginal<typeof import('./engine/demo.js')>()),
   DemoFeeder: class {
     constructor(options: { intervalMs?: number; seed?: number }) {
       mocks.demoOptions.push(options);
@@ -214,5 +229,34 @@ describe('main() demo boot + shutdown', () => {
     expect(mocks.demoStart).not.toHaveBeenCalled();
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('demo mode ignored with --index'));
     errSpy.mockRestore();
+  });
+
+  it('stops the demo feeder when the SSE server closes', async () => {
+    // One-shot runSse whose 'close' event fires on the next macrotask, so
+    // main()'s await resolves and the teardown path runs to completion.
+    mocks.runSse.mockResolvedValueOnce({
+      server: {
+        on: (_event: string, cb: () => void) => void setTimeout(cb, 0),
+        close: () => undefined,
+      },
+      close: async () => undefined,
+    });
+    const dbClose = vi.fn();
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
+      transaction: <T>(fn: () => T): T => fn(), close: dbClose,
+    });
+    mocks.demoStart.mockClear();
+    mocks.demoStop.mockClear();
+    await main(['--demo', '--transport', 'sse', '--port', '9997', '--no-web']);
+    // The feeder booted after the transport came up...
+    expect(mocks.demoStart).toHaveBeenCalledTimes(1);
+    // ...was stopped before the branch closed the DB...
+    expect(mocks.demoStop).toHaveBeenCalledTimes(1);
+    expect(dbClose).toHaveBeenCalledTimes(1);
+    expect(mocks.demoStop.mock.invocationCallOrder[0]).toBeDefined();
+    expect(dbClose.mock.invocationCallOrder[0]).toBeDefined();
+    // Non-null: the two assertions above prove both calls happened.
+    expect(mocks.demoStop.mock.invocationCallOrder[0]!).toBeLessThan(dbClose.mock.invocationCallOrder[0]!);
   });
 });
