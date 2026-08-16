@@ -31,9 +31,11 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 // Windows: npm is a .cmd shim. Spawning it directly breaks stdio capture
 // (stderr comes back empty on failure, defeating E404 detection), so npm
-// goes through the shell on win32; args here are simple tokens passed as
-// an array, and execFileSync handles shell escaping so no manual joining
-// is needed.
+// goes through the shell on win32. SAFETY INVARIANT: with shell enabled,
+// execFileSync performs NO per-argument escaping — Node joins file + args
+// into one raw cmd.exe command line. It is safe ONLY because every token
+// here is a metacharacter-free constant ('view', 'publish', '--otp=<digits>',
+// '<name>@<version>'). Never pass untrusted input through this path.
 const NPM = 'npm';
 const winShell = process.platform === 'win32' ? { shell: true } : {};
 
