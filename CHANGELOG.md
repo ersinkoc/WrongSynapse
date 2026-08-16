@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.3] — 2026-08-16
+## [0.1.4] — 2026-08-16
+
+Patch release: fix web UI frontend build errors, align web API versioning, prevent SQL parameter overflows, and clean up dead code.
+
+### Fixed
+
+- **Web UI frontend TypeScript compilation errors** — fixed `TS5097` import extension restrictions across all React components, added missing `@radix-ui/react-icons` dependency, updated React 19 JSX element types, and removed unused imports in `MemoryList.tsx`. `npm run web:build` and `npm run web:typecheck` now build and typecheck cleanly.
+- **Admin web API `/api/health` version drift** — replaced hardcoded `'0.1.0'` with dynamic `SERVER_VERSION` from `package.json`, ensuring the admin web UI header displays the true server version.
+- **SQLite parameter limit overflow in `buildMemoryGraph`** — reduced graph edge query chunk size from 500 to 400 (`400 * 2 = 800 <= 999`), preventing `too many SQL variables` exceptions on large memory graphs in SQLite.
+- **Dead code in `buildScope`** — simplified `src/utils/scope.ts` by removing redundant duplicate `if-else` branches.
+
+### Changed
+
+- **SPA static directory resolution** — passed `spaDir` directly into `runWebServer` in `src/index.ts` while preserving 100% test branch coverage.
 
 Patch release: the 0.1.2 tarball shipped docs for the admin web UI but not
 its code, and `--version` printed a hardcoded 0.1.0. This release ships the
@@ -187,6 +200,8 @@ SQLite entity graph, fully offline.
   coverage enforced in CI (Node 22 + 24 matrix), typecheck and build gates,
   and an `npm audit` (high/critical) gate.
 
-[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.0...v0.1.2
 [0.1.0]: https://github.com/ersinkoc/WrongSynapse/releases/tag/v0.1.0
