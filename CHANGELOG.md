@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Demo mode: continuous synthetic memory ingestion** — `--demo` (or
+  `npm run demo`) streams seeded observations into the candidate pool and
+  periodically consolidates them: high-confidence keepers are promoted into
+  `memory_entry` entities (embedding + `ANCHORED_TO` edge, mirroring the
+  `synapse_promote_candidate` MCP tool), noise is discarded. The stream is
+  reproducible (`--demo-seed`, mulberry32 PRNG), namespaced under
+  `proj:demo/...`, and isolated by default into `./synapse-demo.db` so demo
+  data can never mix into a real database. Tuning: `--demo-interval` (ms,
+  default 1000) with `SYNAPSE_DEMO`, `SYNAPSE_DEMO_INTERVAL`, and
+  `SYNAPSE_DEMO_SEED` env equivalents. `DemoFeeder` is exported from the
+  library surface for programmatic use.
+
 ## [0.1.4] — 2026-08-16
 
 Patch release: fix web UI frontend build errors, align web API versioning, prevent SQL parameter overflows, and clean up dead code.
@@ -25,6 +39,8 @@ Patch release: fix web UI frontend build errors, align web API versioning, preve
 Patch release: the 0.1.2 tarball shipped docs for the admin web UI but not
 its code, and `--version` printed a hardcoded 0.1.0. This release ships the
 real thing.
+
+## [0.1.3] — 2026-08-16
 
 ### Added
 

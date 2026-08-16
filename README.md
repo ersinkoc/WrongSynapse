@@ -201,6 +201,23 @@ The candidate pool is the write buffer for episodic memory: observations accumul
 
 ---
 
+## Demo mode
+
+`--demo` (or `npm run demo`) continuously streams synthetic observations into memory and periodically consolidates them — promoting high-confidence keepers into permanent `memory_entry` entities (with embeddings and `ANCHORED_TO` graph edges) and discarding noise. It is the fastest way to watch the full memory lifecycle live in the admin web UI: candidates pile up in the pool, keepers get promoted, and the Graph tab grows real anchor edges.
+
+```bash
+npm run demo                              # 1 observation/second, seeded 42
+npx wrongsynapse --demo --demo-interval 250 --demo-seed 7
+SYNAPSE_DEMO=1 SYNAPSE_DEMO_INTERVAL=5000 wrongsynapse
+```
+
+- **Isolated by default** — demo mode writes to `./synapse-demo.db`, never your real `synapse.db` (pass `--db` to override deliberately).
+- **Reproducible** — content, scope rotation, and confidence all derive from the seeded PRNG (`--demo-seed`); the same seed replays the same stream.
+- **Namespaced** — every demo entity lives under `proj:demo/...`, so demo data can be swept with one scope-prefix delete and can never interleave with real project scopes.
+- **Observes the MCP semantics** — the feeder mirrors `synapse_record_observation` → `synapse_promote_candidate` / `synapse_discard_candidate`, including graceful degradation when the embedding model is unavailable (promoted without a vector).
+
+---
+
 ## CLI reference
 
 ```
