@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-08-16
+
+Patch release: demo mode — continuous synthetic memory ingestion, hardened
+across two review passes.
+
 ### Added
 
 - **Demo mode: continuous synthetic memory ingestion** — `--demo` (or
@@ -20,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default 1000) with `SYNAPSE_DEMO`, `SYNAPSE_DEMO_INTERVAL`, and
   `SYNAPSE_DEMO_SEED` env equivalents. `DemoFeeder` is exported from the
   library surface for programmatic use.
+- **Demo data-safety guarantees** — consolidations decide only over
+  demo-owned candidates (an `extracted_from` ownership filter), so pointing
+  `--demo` at a real database via the `--db` escape hatch never promotes
+  or discards the user's own pending observations; `DemoFeeder.stop()` is
+  async and drains any in-flight tick before the database closes (no
+  write/teardown races), and signal shutdown (SIGINT/SIGTERM) is
+  re-entry-guarded with feeder → web UI → DB ordering.
 
 ## [0.1.4] — 2026-08-16
 
@@ -216,7 +228,8 @@ SQLite entity graph, fully offline.
   coverage enforced in CI (Node 22 + 24 matrix), typecheck and build gates,
   and an `npm audit` (high/critical) gate.
 
-[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ersinkoc/WrongSynapse/compare/v0.1.0...v0.1.2
