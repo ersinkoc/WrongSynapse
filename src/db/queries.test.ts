@@ -12,10 +12,16 @@ import {
   deleteStaleIndexedEntities,
   deleteVector,
   findEntitiesByScope,
+  findMemories,
+  findSimilarMemories,
+  getCandidate,
+  getNeighbors,
   getVectors,
   insertCandidate,
   insertEntity,
+  insertRelation,
   listCandidates,
+  mergeMemories,
   setCandidateStatus,
 } from './queries.js';
 
@@ -124,5 +130,123 @@ describe('findEntitiesByScope / getVectors (boundary-aware prefixes)', () => {
     expect(ids).toContain('pfx-in');
     expect(ids).toContain('pfx-deep');
     expect(ids).not.toContain('pfx-sibling');
+  });
+});
+
+describe('findSimilarMemories guards', () => {
+  beforeAll(() => {
+    insertEntity(db, { id: 'sim-a', type: 'memory_entry', scopePath: 'proj:sim/file:a.ts', name: 'a', content: 'alpha note', memoryKind: 'convention' });
+    insertEntity(db, { id: 'sim-b', type: 'memory_entry', scopePath: 'proj:other/file:b.ts', name: 'b', content: 'beta note', memoryKind: 'fact' });
+    // Same text as sim-a → cosine 1 within scope; different scope.
+    const vec = new Float32Array(4).fill(0.5);
+    for (const id of ['sim-a', 'sim-b']) {
+      db.prepare('INSERT INTO entity_vectors (entity_id, embedding) VALUES (?, ?)').run(id, Buffer.from(vec.buffer));
+    }
+  });
+
+  it('returns [] for an empty query embedding or a zero vector', () => {
+    expect(findSimilarMemories(db, new Float32Array(0), 0.5, null, 10)).toEqual([]);
+    expect(findSimilarMemories(db, new Float32Array(8), 0.5, null, 10)).toEqual([]);
+  });
+
+  it('filters by memory kind and scope prefix SQL-side', () => {
+    const probe = new Float32Array(4).fill(0.5);
+    const all = findSimilarMemories(db, probe, 0.5, null, 10);
+    expect(all.map((h) => h.entityId).sort()).toEqual(['sim-a', 'sim-b']);
+    const conventions = findSimilarMemories(db, probe, 0.5, 'convention', 10);
+    expect(conventions.map((h) => h.entityId)).toEqual(['sim-a']);
+    const scoped = findSimilarMemories(db, probe, 0.5, null, 10, ['proj:other']);
+    expect(scoped.map((h) => h.entityId)).toEqual(['sim-b']);
+  });
+
+  it('skips dimension-mismatched stored vectors instead of throwing', () => {
+    insertEntity(db, { id: 'sim-odd', type: 'memory_entry', scopePath: 'proj:sim/file:c.ts', name: 'c', content: 'odd dims' });
+    db.prepare('INSERT INTO entity_vectors (entity_id, embedding) VALUES (?, ?)').run('sim-odd', Buffer.from(new Float32Array(3).buffer));
+    const probe = new Float32Array(4).fill(0.5);
+    const hits = findSimilarMemories(db, probe, 0.5, null, 10);
+    expect(hits.some((h) => h.entityId === 'sim-odd')).toBe(false);
+    expect(hits.length).toBeGreaterThan(0); // well-formed rows still scored
+  });
+
+  it('defaults a NULL memory_kind column to general', () => {
+    // Pre-v2 rows (or manual SQL) can carry a NULL memory_kind — the mapper
+    // must coerce it instead of surfacing "null".
+    db.prepare(
+      "INSERT INTO entities (id, type, scope_path, name, content, memory_kind, importance, created_at, updated_at, tags) VALUES ('sim-nullkind', 'memory_entry', 'proj:sim/file:d.ts', 'd', 'null kind probe', NULL, 0.5, ?, ?, '[]')",
+    ).run(Date.now(), Date.now());
+    db.prepare('INSERT INTO entity_vectors (entity_id, embedding) VALUES (?, ?)').run('sim-nullkind', Buffer.from(new Float32Array(4).fill(0.5).buffer));
+    const hits = findSimilarMemories(db, new Float32Array(4).fill(0.5), 0.5, null, 10);
+    const hit = hits.find((h) => h.entityId === 'sim-nullkind');
+    expect(hit).toBeDefined();
+    expect(hit!.memoryKind).toBe('general');
+  });
+});
+
+describe('mergeMemories guards', () => {
+  it('refuses to merge an entity with itself', () => {
+    expect(mergeMemories(db, 'sim-a', 'sim-a')).toBe(false);
+  });
+
+  it('returns false when either side is missing', () => {
+    expect(mergeMemories(db, 'does-not-exist', 'sim-a')).toBe(false);
+    expect(mergeMemories(db, 'sim-a', 'does-not-exist')).toBe(false);
+  });
+
+  it('merges two metadata-less memories end to end', () => {
+    insertEntity(db, { id: 'mg-w', type: 'memory_entry', scopePath: 'proj:mg/file:w.ts', name: 'w', content: 'winner text', memoryKind: 'fact', importance: 0.4, tags: ['keepme'] });
+    insertEntity(db, { id: 'mg-l', type: 'memory_entry', scopePath: 'proj:mg/file:l.ts', name: 'l', content: 'loser text', memoryKind: 'fact', importance: 0.9 });
+    expect(mergeMemories(db, 'mg-w', 'mg-l')).toBe(true);
+    const winner = findMemories(db, { scopePrefixes: ['proj:mg'], includeExpired: true });
+    const w = winner.find((e) => e.id === 'mg-w');
+    const l = winner.find((e) => e.id === 'mg-l');
+    expect(w?.importance).toBe(0.9); // absorbed the loser's importance
+    expect(w?.tags).toEqual(['keepme']);
+    expect(l?.expiresAt).toBe(0); // archived, not deleted
+  });
+});
+
+describe('insertRelation / insertCandidate defaults', () => {
+  it('generates ids and applies default weight/confidence when omitted', () => {
+    const before = dbStats(db);
+    insertRelation(db, { sourceId: 'sim-a', targetId: 'sim-b', relation: 'RELATES_TO' });
+    expect(dbStats(db).relations).toBe(before.relations + 1);
+    const rel = getNeighbors(db, 'sim-a', { relationFilter: ['RELATES_TO'] });
+    expect(rel.length).toBe(1);
+
+    const candidateId = insertCandidate(db, { content: 'default confidence probe' });
+    const candidate = getCandidate(db, candidateId);
+    expect(candidate?.confidence).toBe(0.7);
+    expect(candidate?.status).toBe('pending');
+  });
+});
+
+describe('findMemories filter arms', () => {
+  beforeAll(() => {
+    insertEntity(db, { id: 'fm-explicit', type: 'memory_entry', scopePath: 'proj:fm/file:x.ts', name: 'x', content: 'explicit types probe', memoryKind: 'fact', importance: 0.9, expiresAt: Date.now() - 1000, tags: ['legacy'] });
+    insertEntity(db, { id: 'fm-file', type: 'file', scopePath: 'proj:fm/file:y.ts', name: 'y.ts', content: 'not a memory' });
+  });
+
+  it('honours an explicit types filter (not just the memory_entry default)', () => {
+    const files = findMemories(db, { types: ['file'], scopePrefixes: ['proj:fm'] });
+    expect(files.some((e) => e.id === 'fm-file')).toBe(true);
+    expect(files.every((e) => e.type === 'file')).toBe(true);
+  });
+
+  it('treats importanceMin as optional', () => {
+    const all = findMemories(db, { scopePrefixes: ['proj:fm'], includeExpired: true });
+    expect(all.length).toBeGreaterThan(0);
+  });
+
+  it('includes expired memories only when explicitly asked', () => {
+    const fresh = findMemories(db, { scopePrefixes: ['proj:fm'] });
+    expect(fresh.some((e) => e.id === 'fm-explicit')).toBe(false);
+    const withExpired = findMemories(db, { scopePrefixes: ['proj:fm'], includeExpired: true });
+    expect(withExpired.some((e) => e.id === 'fm-explicit')).toBe(true);
+  });
+
+  it('filters by tag', () => {
+    const tagged = findMemories(db, { scopePrefixes: ['proj:fm'], tags: ['legacy'], includeExpired: true });
+    expect(tagged.some((e) => e.id === 'fm-explicit')).toBe(true);
+    expect(findMemories(db, { scopePrefixes: ['proj:fm'], tags: ['nope'], includeExpired: true })).toEqual([]);
   });
 });

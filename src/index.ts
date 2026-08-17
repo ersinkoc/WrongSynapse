@@ -20,7 +20,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { buildHnswIndexes, openDatabase, type SynapseDatabase } from './db/connection.js';
+import { buildVecIndex, openDatabase, type SynapseDatabase } from './db/connection.js';
 import { assertFts5, migrate } from './db/schema.js';
 import { dbStats } from './db/queries.js';
 import { getSharedEmbedder } from './engine/embedding.js';
@@ -33,6 +33,7 @@ import { runWebServer, type WebServerHandle } from './web/server.js';
 interface CliValues {
   transport?: string;
   port?: string;
+  'sse-host'?: string;
   db?: string;
   index?: string;
   'model-dir'?: string;
@@ -58,6 +59,9 @@ USAGE
 OPTIONS
   --transport <stdio|sse>   MCP transport (default: stdio)
   --port <number>           SSE HTTP port (default: 8765)
+  --sse-host <host>         SSE bind address (default: 127.0.0.1 — loopback only;
+                            expose to the LAN only on trusted networks: the SSE
+                            transport has no authentication)
   --db <path>               SQLite database path (default: ./synapse.db, env SYNAPSE_DB_PATH)
   --model-dir <dir>         Local model files (env SYNAPSE_MODEL_DIR)
   --allow-remote-model      Always allow remote model fetches (env SYNAPSE_ALLOW_REMOTE_MODEL=1)
@@ -82,6 +86,7 @@ ENVIRONMENT
                             downloads the model once automatically on first use)
   SYNAPSE_NO_REMOTE_MODEL   Set to 1 for strict offline: never download, cache-only
   SYNAPSE_PORT              SSE HTTP port when --port is absent (default 8765)
+  SYNAPSE_SSE_HOST          SSE bind address when --sse-host is absent (default 127.0.0.1)
   SYNAPSE_WEB               Set to 0 to disable the optional admin web UI (default: enabled)
   SYNAPSE_WEB_PORT          Web UI port (default: kernel-assigned free port — different on every start)
   SYNAPSE_WEB_OPEN          Set to 1 to auto-open the web UI when it starts (default: off)
@@ -206,6 +211,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     options: {
       transport: { type: 'string', default: 'stdio' },
       port: { type: 'string' },
+      'sse-host': { type: 'string' },
       db: { type: 'string' },
       index: { type: 'string' },
       'model-dir': { type: 'string' },
@@ -260,13 +266,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   activeDb = db;
   migrate(db);
   assertFts5(db);
+  // Surface the resolved database location: the default is CWD-relative, so
+  // MCP hosts that spawn the server from different working directories would
+  // otherwise silently open different databases.
+  console.error(`WrongSynapse database: ${resolve(db.path)}`);
 
-  // sqlite-vec HNSW index: build once from existing BLOB vectors if the
-  // extension loaded. Safe to call on every boot (IF NOT EXISTS guard inside).
-  // `db.vec` is optional — mocked databases in tests don't populate it.
-  if (db.vec?.hnswEnabled && !db.vec.hnswBuildComplete) {
-    buildHnswIndexes(db);
-    db.vec.hnswBuildComplete = true;
+  // sqlite-vec KNN index: build once from the existing BLOB vectors when the
+  // extension loaded. Safe to call on every boot (marker + row-count check
+  // inside); runtime writes keep it in sync afterwards. `db.vec` is optional
+  // — mocked databases in tests don't populate it. buildVecIndex only reports
+  // success when vec_entities is actually usable — a failed build leaves
+  // indexReady false so hybrid search takes the exact-scan path.
+  if (db.vec?.extensionLoaded && !db.vec.indexReady) {
+    buildVecIndex(db);
   }
 
   const modelDir = cli['model-dir'] !== undefined && cli['model-dir'] !== '' ? cli['model-dir'] : undefined;
@@ -353,8 +365,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     if (!Number.isFinite(port) || port <= 0) {
       throw new Error(`invalid port '${portRaw}' (from ${cli.port !== undefined ? '--port' : 'SYNAPSE_PORT'})`);
     }
-    const handle = await runSse(ctx, port);
-    console.error(`WrongSynapse SSE server listening on http://localhost:${port}/sse`);
+    // The SSE transport exposes EVERY MCP tool (including workspace file
+    // indexing) with no auth, so it binds to loopback unless the operator
+    // explicitly opts into LAN exposure with --sse-host.
+    const host = cli['sse-host'] ?? process.env['SYNAPSE_SSE_HOST'] ?? '127.0.0.1';
+    const handle = await runSse(ctx, port, host);
+    console.error(`WrongSynapse SSE server listening on http://${host}:${port}/sse`);
     activeSse = handle;
     const demo = startDemo();
     activeDemo = demo;
@@ -410,16 +426,36 @@ let activeDemo: DemoFeeder | null = null;
 /** The in-progress teardown, if any (re-entry guard for stacked signals). */
 let shutdownPromise: Promise<void> | null = null;
 
-/** Stop the live demo feeder + web server + close the DB and exit (SIGINT/SIGTERM); installed only in the entry-point branch. */
+/** Stop the live demo feeder + web server + close the DB and exit (SIGINT/SIGTERM/SIGBREAK); installed only in the entry-point branch. */
 function shutdown(): Promise<void> {
   // Re-entry guard: a second signal arriving while the first teardown is
   // still awaiting the in-flight demo tick must await the SAME teardown —
   // a parallel run would close the DB under the still-running tick.
   shutdownPromise ??= (async () => {
+    // Safety net: a hung close (e.g. a live SSE stream that never goes idle)
+    // must not make the process unkillable — force-exit after a deadline.
+    /* v8 ignore next 5 -- only fires when teardown hangs past the 5s deadline;
+       simulating a hung server close deterministically in-process is not
+       worth a 5s test for a two-line safety net. */
+    const forceExitTimer = setTimeout(() => {
+      console.error('WrongSynapse: graceful shutdown timed out after 5s; forcing exit.');
+      process.exit(0);
+    }, 5000);
+    forceExitTimer.unref();
     try {
       await activeDemo?.stop();
     } catch {
       // best-effort stop on exit
+    }
+    // Drop keep-alive/idle sockets first: httpServer.close() only resolves
+    // once every connection ends, and an idle-but-open connection (or an SSE
+    // stream) would otherwise hang the teardown until the force-exit timer.
+    for (const handle of [activeSse, activeWeb]) {
+      try {
+        handle?.server.closeIdleConnections?.();
+      } catch {
+        // best-effort: not every server instance exposes the method
+      }
     }
     try {
       // Closing the SSE server ends its sessions cleanly (and resolves the
@@ -438,6 +474,7 @@ function shutdown(): Promise<void> {
     } catch {
       // best-effort close on exit
     }
+    clearTimeout(forceExitTimer);
     process.exit(0);
   })();
   return shutdownPromise;
@@ -476,6 +513,17 @@ export function isMainEntryPoint(
   return metaMain === true;
 }
 
+/**
+ * Log (not crash on) a stray rejection. Registered at the entry point only:
+ * Node's default policy would otherwise take down the whole server — open
+ * database included — for any unobserved promise rejection.
+ */
+export function logUnhandledRejection(reason: unknown): void {
+  console.error(
+    `WrongSynapse: unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`,
+  );
+}
+
 const isEntryPoint = isMainEntryPoint(import.meta.url, process.argv[1], (import.meta as { main?: boolean }).main);
 
 // Covered in-process by the entry-point lifecycle tests in src/index.test.ts
@@ -486,8 +534,15 @@ if (isEntryPoint) {
   // main() never register process-level handlers.
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // Ctrl+Break on Windows: Node maps it to SIGBREAK; SIGTERM is effectively
+  // undeliverable there, so without this handler Ctrl+Break skips teardown.
+  /* v8 ignore next -- win32-only arm: the linux coverage host never enters it */
+  if (process.platform === 'win32') process.on('SIGBREAK', shutdown);
+  // A stray rejection anywhere in the server must log instead of taking the
+  // whole process (and the open database) down — Node's default is a crash.
+  process.on('unhandledRejection', logUnhandledRejection);
   main().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(error instanceof Error ? error.stack ?? error.message : String(error));
     process.exit(1);
   });
 }

@@ -89,9 +89,44 @@ export class EmbeddingCache {
         return embedding;
       },
       embedBatch: async (texts: readonly string[]): Promise<Float32Array[]> => {
-        const results: Float32Array[] = [];
-        for (const text of texts) {
-          results.push(await this.wrap(embedder).embed(text));
+        // Cache-aware batching: resolve every hit synchronously, then compute
+        // ALL misses in ONE underlying embedBatch call. Awaiting the wrapped
+        // embed() per text would collapse the embedder's internal batching
+        // (chunked ONNX inference) into N sequential single-text runs.
+        const now = Date.now();
+        const results: Float32Array[] = new Array<Float32Array>(texts.length);
+        const misses: { index: number; text: string; key: string }[] = [];
+        texts.forEach((text, index) => {
+          const key = hashKey(text);
+          const entry = this.cache.get(key);
+          if (entry !== undefined) {
+            if (entry.expiresAt > now) {
+              this.hits += 1;
+              entry.lastUsedAt = now;
+              this.cache.delete(key);
+              this.cache.set(key, entry);
+              results[index] = entry.embedding;
+              return;
+            }
+            this.expirations += 1;
+            this.cache.delete(key);
+          }
+          misses.push({ index, text, key });
+        });
+        this.misses += misses.length;
+        if (misses.length > 0) {
+          const vectors = await embedder.embedBatch(misses.map((miss) => miss.text));
+          misses.forEach((miss, offset) => {
+            // An embedder may legally return fewer rows than requested; the
+            // holes stay undefined and callers skip them (same contract as
+            // the uncached embedBatch).
+            /* v8 ignore next */
+            const vector = vectors[offset];
+            if (vector !== undefined) {
+              results[miss.index] = vector;
+              this.insert(miss.key, vector, now + this.ttlMs);
+            }
+          });
         }
         return results;
       },

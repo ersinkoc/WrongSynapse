@@ -49,8 +49,13 @@ export interface SseServerHandle {
   close(): Promise<void>;
 }
 
-/** Run the MCP server over SSE on the given port; returns once listening. */
-export async function runSse(ctx: ToolContext, port: number): Promise<SseServerHandle> {
+/** Run the MCP server over SSE; returns once listening.
+ *
+ *  `host` defaults to loopback: the SSE surface exposes every MCP tool —
+ *  including `synapse_index_workspace`, which reads local files — with no
+ *  authentication, so binding 0.0.0.0 must stay an explicit operator choice
+ *  (`--sse-host`). */
+export async function runSse(ctx: ToolContext, port: number, host = '127.0.0.1'): Promise<SseServerHandle> {
   const httpServer = createServer();
   // One McpServer per SSE session: the SDK's Protocol accepts a single
   // transport per server instance, so sharing one server across connections
@@ -111,7 +116,13 @@ export async function runSse(ctx: ToolContext, port: number): Promise<SseServerH
     void handleRequest(req, res);
   });
 
-  await new Promise<void>((resolvePromise) => httpServer.listen(port, resolvePromise));
+  // A listen failure (port in use, EACCES, bad host) must reject the boot
+  // promise so main()'s catch can fail loudly — without this listener the
+  // 'error' event would surface as an uncaught exception from the event loop.
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    httpServer.on('error', (error: Error) => rejectPromise(error));
+    httpServer.listen(port, host, () => resolvePromise());
+  });
 
   const close = async (): Promise<void> => {
     // Close every live session's server (ends its SSE response, which fires

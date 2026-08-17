@@ -22,7 +22,7 @@ The three channels are fused with **Reciprocal Rank Fusion (RRF, k = 60)** into 
 | | |
 |---|---|
 | **Node.js** | ≥ 22 (22 and 24 tested in CI; `node:sqlite` fallback needs ≥ 22.5) |
-| **OS** | Windows, Linux, macOS (CI: `ubuntu-latest`; dev-verified on Windows) |
+| **OS** | Windows, Linux, macOS (CI: `ubuntu-latest` + `windows-latest`; native modules exercised on both) |
 | **Disk** | ≈ 25 MB for the embedding model (q8 ONNX — downloaded automatically on first use, then offline) |
 | **git** | optional — only for `--git` history linking |
 
@@ -65,11 +65,17 @@ wrongsynapse --web-port 9090
 
 The web server binds to `127.0.0.1` only and **never governs process
 lifetime** (`httpServer.unref()`); a web-bind failure logs a warning and
-the MCP server continues unaffected. Destructive operations (DELETE
-`/api/memory/:id`) require an `Authorization: Bearer <token>` header
-where the token is a random hex string generated at every boot and printed
-to stderr on the line after the listen URL (`admin web UI delete token:
-…`) — read-only endpoints (health, stats, search, list, graph) are open.
+the MCP server continues unaffected. Every request must carry a loopback
+`Host` header (`127.0.0.1` / `localhost` / `[::1]`, any port) — anything
+else is rejected with 403, which closes the DNS-rebinding route of reading
+the corpus from a remote website via the user's own browser. Destructive
+operations (DELETE `/api/memory/:id`) additionally require an
+`Authorization: Bearer <token>` header where the token is a random hex
+string generated at every boot and printed to stderr on the line after the
+listen URL (`admin web UI delete token: …`) — read-only endpoints (health,
+stats, search, list, graph) are open. Responses carry baseline hardening
+headers (`X-Content-Type-Options: nosniff`; the SPA shell additionally gets
+`X-Frame-Options: DENY` and a `Content-Security-Policy`).
 
 The SPA is built separately from the Node bundle so the published npm
 package stays lean. From a checkout:
@@ -81,9 +87,10 @@ npm run web:typecheck  # tsc -b --noEmit on the SPA only
 ```
 
 `npm run web:install` runs `npm --prefix web install` for CI to pre-populate
-`web/node_modules/` before the build step. The build artifact (`web/dist/`)
-is git-ignored; the npm-published tarball contains only `dist/` (the Node
-server bundle).
+`web/node_modules/` before the typecheck/build steps. The build artifact
+(`web/dist/`) is git-ignored but IS shipped: the npm-published tarball
+contains `dist/` (the Node server bundle), `web/dist/` (the SPA),
+`skills/`, and `CHANGELOG.md`.
 
 The web server's REST surface (used by the SPA and by anyone scripting
 against the admin panel):
@@ -149,16 +156,19 @@ WrongSynapse speaks the Model Context Protocol over stdio or SSE. Point any MCP 
 }
 ```
 
-**Cursor / any stdio MCP client** — command `wrongsynapse` (installed globally or via `npx wrongsynapse`), then the eight `synapse_*` tools appear.
+**Cursor / any stdio MCP client** — command `wrongsynapse` (installed globally or via `npx wrongsynapse`), then the thirteen `synapse_*` tools appear.
 
 **SSE (remote / concurrent clients)**:
 
 ```bash
 wrongsynapse --transport sse --port 8765
-# endpoint: http://localhost:8765/sse
+# endpoint: http://localhost:8765/sse  (binds 127.0.0.1 by default)
+
+# Explicitly expose to the LAN (no auth on this transport — trusted networks only):
+wrongsynapse --transport sse --port 8765 --sse-host 0.0.0.0
 ```
 
-Each SSE connection gets its own MCP session — multiple agents can query one shared database concurrently.
+Each SSE connection gets its own MCP session — multiple agents can query one shared database concurrently. The SSE transport exposes every MCP tool with no authentication, so it binds to loopback unless you opt in with `--sse-host` (env: `SYNAPSE_SSE_HOST`).
 
 ### Install as an agent skill (skills.sh)
 
@@ -168,15 +178,15 @@ WrongSynapse ships a [skills.sh](https://www.skills.sh/)-compatible agent skill 
 npx skills add ersinkoc/WrongSynapse
 ```
 
-This drops `skills/wrongsynapse/SKILL.md` into your agent's skill directory. The skill instructs the agent to use the eight `synapse_*` MCP tools — configure the MCP server as shown above (`command: wrongsynapse`) so both halves are connected. To use the skill straight from a checkout instead, copy `skills/wrongsynapse/SKILL.md` into your agent's skills folder.
+This drops `skills/wrongsynapse/SKILL.md` into your agent's skill directory. The skill instructs the agent to use the `synapse_*` MCP tools — configure the MCP server as shown above (`command: wrongsynapse`) so both halves are connected. To use the skill straight from a checkout instead, copy `skills/wrongsynapse/SKILL.md` into your agent's skills folder.
 
 ---
 
-## The eight MCP tools
+## The thirteen MCP tools
 
 | Tool | Purpose |
 |---|---|
-| `synapse_index_workspace` | Scan a workspace; parse structure + AST symbols (TS/JS/Py/Go/Rust via tree-sitter); embed; optionally link git commits; persist the hierarchy. |
+| `synapse_index_workspace` | Scan a workspace; parse structure + AST symbols (TS/TSX/JS/Py/Go/Rust via tree-sitter); embed; optionally link git commits; persist the hierarchy. |
 | `synapse_hybrid_query` | Tri-hybrid RRF retrieval with scope/type filters, per-channel weight tuning (`vector`/`lexical`/`graph`, `graph_depth`), and contextual graph paths. |
 | `synapse_anchor_memory` | Store a decision/convention note anchored to a symbol, file, package, or project scope (with embedding + `ANCHORED_TO` edge). |
 | `synapse_graph_neighbors` | Traverse the relational sub-graph (callers/callees, anchored memories, hierarchy, commits); accepts an entity id **or** an exact scope path. |
@@ -184,6 +194,11 @@ This drops `skills/wrongsynapse/SKILL.md` into your agent's skill directory. The
 | `synapse_promote_candidate` | Promote a pending candidate into a permanent memory entity: embedding computed, `ANCHORED_TO` link created. |
 | `synapse_list_candidates` | List the candidate pool, filterable by lifecycle status (`pending` / `promoted` / `discarded`). |
 | `synapse_discard_candidate` | Discard a pending candidate — **terminal**: a discarded candidate can never be promoted. |
+| `synapse_remember` | Store a durable memory (fact/convention/decision/warning/anti-pattern) with kind, importance, TTL, tags, and cosine-≥0.85 auto-deduplication into a SUPERSEDES chain. |
+| `synapse_recall` | Retrieve memories filtered by kind, importance, tags, or scope prefix; updates `last_accessed_at` (access tracking). |
+| `synapse_memory_search` | Tri-hybrid search over all entities filtered by `memory_kind`/type, with per-channel ranks and graph paths. |
+| `synapse_link_memories` | Link two memory entries with a `SUPERSEDES` relation (version chains, corrections). |
+| `synapse_purge_expired` | Delete all TTL-expired memory entries. |
 
 ### Memory lifecycle
 
@@ -227,6 +242,9 @@ wrongsynapse [options]
 
   --transport <stdio|sse>   MCP transport (default: stdio)
   --port <number>           SSE HTTP port (default: 8765, env SYNAPSE_PORT)
+  --sse-host <host>         SSE bind address (default: 127.0.0.1, env SYNAPSE_SSE_HOST;
+                            the SSE transport is unauthenticated — only expose on
+                            trusted networks)
   --db <path>               SQLite database path (default ./synapse.db, env SYNAPSE_DB_PATH)
   --model-dir <dir>         Local embedding model directory (env SYNAPSE_MODEL_DIR)
   --allow-remote-model      Always allow remote model fetches (env SYNAPSE_ALLOW_REMOTE_MODEL=1)
@@ -250,6 +268,7 @@ The database is closed cleanly on SIGINT/SIGTERM (server modes) and immediately 
 | `SYNAPSE_ALLOW_REMOTE_MODEL` | `1` to always allow remote model fetches (the default already downloads once automatically) | unset (auto) |
 | `SYNAPSE_NO_REMOTE_MODEL` | `1` for strict offline — never download, cache-only | unset (auto) |
 | `SYNAPSE_PORT` | SSE HTTP port when `--port` is absent | `8765` |
+| `SYNAPSE_SSE_HOST` | SSE bind address when `--sse-host` is absent | `127.0.0.1` |
 
 ---
 
@@ -330,7 +349,7 @@ npm run build         # tsc -> dist/ (ESM + .d.ts)
 npm publish --dry-run # prepublishOnly guard runs typecheck + test + build first
 ```
 
-CI (`.github/workflows/ci.yml`) runs the full matrix on push/PR: Node 22 + 24, typecheck, tests with the 100% coverage gate, build, and `npm audit` (fails on high/critical).
+CI (`.github/workflows/ci.yml`) runs on push/PR: Node 22 + 24 on Linux (typecheck, tests with the 100% coverage gate, build, `npm audit` failing on high/critical, plus the web SPA typecheck + build) and a Windows job (typecheck, tests, build) that exercises the native modules on the platform the project is developed on.
 
 ### Project layout
 

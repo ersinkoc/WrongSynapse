@@ -57,7 +57,7 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase }));
+vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase, buildVecIndex: vi.fn(() => true) }));
 vi.mock('./db/schema.js', () => ({ migrate: mocks.migrate, assertFts5: mocks.assertFts5 }));
 vi.mock('./db/queries.js', () => ({
   dbStats: mocks.dbStats,

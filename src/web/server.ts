@@ -24,6 +24,7 @@ import {
   dbStats,
   deleteEntity,
   findEntitiesByScope,
+  getEntities,
   getEntity,
   getGraphPath,
   listCandidates,
@@ -106,6 +107,48 @@ function jsonResponse(status: number, payload: unknown): WebResponse {
 function errorResponse(status: number, message: string): WebResponse {
   return jsonResponse(status, { error: message });
 }
+
+/**
+ * Host-header allow-list (DNS-rebinding defense).
+ *
+ * Binding to 127.0.0.1 alone does NOT stop a remote website from reading
+ * these endpoints: a DNS-rebind makes the attacker's hostname resolve to
+ * 127.0.0.1, the request becomes same-origin (CORS never applies), and the
+ * browser happily reads the memory corpus off localhost. Rejecting any
+ * request whose Host is not a loopback name closes that hole — the rebinding
+ * attack depends on the attacker's own hostname reaching the server.
+ */
+const ALLOWED_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+/** True when the Host header names a loopback interface (any port). */
+export function isAllowedHostHeader(host: string | undefined): boolean {
+  if (host === undefined || host === '') return false;
+  let hostname: string;
+  if (host.startsWith('[')) {
+    // Bracketed IPv6 `[::1]:port` (what HTTP mandates): keep the address.
+    hostname = host.slice(0, host.indexOf(']') + 1);
+  } else if ((host.match(/:/g) ?? []).length > 1) {
+    // Bare IPv6 (`::1`): no port suffix to strip.
+    hostname = host;
+  } else {
+    // Hostname or IPv4 with an optional port. split(':')[0] of a non-empty
+    // string is always defined; the fallback is typing hygiene.
+    /* v8 ignore next */
+    hostname = host.split(':')[0] ?? '';
+  }
+  return ALLOWED_HOSTNAMES.has(hostname.toLowerCase());
+}
+
+/** Baseline hardening headers applied to every response the shell sends. */
+function securityHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return { 'x-content-type-options': 'nosniff', ...extra };
+}
+
+/** Extra headers for HTML documents (SPA shell): deny framing and inline scripts. */
+const HTML_SECURITY_HEADERS: Record<string, string> = {
+  'x-frame-options': 'DENY',
+  'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
+};
 
 /** Strict id check: only allow plausible entity ids in path params to prevent path traversal.
  * Production IDs come from `randomUUID()` (36 chars, hex + hyphens); fixture IDs in tests are
@@ -626,9 +669,11 @@ function handleListMemory(ctx: WebContext, url: URL): WebResponse {
     // ?q=...&scope=... silently returned out-of-scope memories.
     const scopePrefixes = scopePrefix !== undefined && scopePrefix !== '' ? [scopePrefix] : [];
     const ftsHits = searchFts(ctx.db, q, limit);
+    // One chunked fetch for all hits instead of a SELECT per row.
+    const entityById = getEntities(ctx.db, ftsHits.map((hit) => hit.entityId));
     const ordered: EntityRow[] = [];
     for (const hit of ftsHits) {
-      const entity = getEntity(ctx.db, hit.entityId);
+      const entity = entityById.get(hit.entityId);
       if (entity === undefined || entity.type !== 'memory_entry') continue;
       if (!scopeMatchesAnyPrefix(entity.scopePath, scopePrefixes)) continue;
       ordered.push(entity);
@@ -888,7 +933,8 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<{ ok: true; b
 }
 
 function sendResponse(res: ServerResponse, web: WebResponse): void {
-  res.writeHead(web.status, web.headers);
+  const headers = { ...securityHeaders(), ...web.headers };
+  res.writeHead(web.status, headers);
   res.end(web.body);
 }
 
@@ -897,6 +943,13 @@ function makeHandler(ctx: WebContext): (req: IncomingMessage, res: ServerRespons
   return (req, res) => {
     void (async (): Promise<void> => {
       try {
+        // DNS-rebinding defense: only loopback Host headers may talk to the
+        // admin API/SPA (see isAllowedHostHeader).
+        if (!isAllowedHostHeader(req.headers.host)) {
+          res.writeHead(403, securityHeaders({ 'content-type': 'text/plain' }));
+          res.end('forbidden: unrecognised Host header');
+          return;
+        }
         /* v8 ignore start */
         // Defensive: Node's IncomingMessage always populates `method` and `url`
         // for parsed requests; the `??` fallbacks exist only for non-standard
@@ -924,14 +977,17 @@ function makeHandler(ctx: WebContext): (req: IncomingMessage, res: ServerRespons
           const asset = await resolveStaticFile(ctx.staticDir, new URL(rawUrl, 'http://localhost').pathname);
           if (asset !== null) {
             const data = await fs.readFile(asset.path);
-            res.writeHead(200, { 'content-type': asset.mime, 'cache-control': 'no-cache' });
+            const extra = asset.mime === 'text/html; charset=utf-8' ? HTML_SECURITY_HEADERS : {};
+            res.writeHead(200, securityHeaders({ 'content-type': asset.mime, 'cache-control': 'no-cache', ...extra }));
             res.end(data);
             return;
           }
           const index = await resolveSpaFallback(ctx.staticDir);
           if (index !== null) {
             const data = await fs.readFile(index.path);
-            res.writeHead(200, { 'content-type': index.mime, 'cache-control': 'no-cache' });
+            // The SPA fallback IS index.html by construction — the HTML
+            // hardening headers apply unconditionally.
+            res.writeHead(200, securityHeaders({ 'content-type': index.mime, 'cache-control': 'no-cache', ...HTML_SECURITY_HEADERS }));
             res.end(data);
             return;
           }

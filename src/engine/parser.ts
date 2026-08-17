@@ -88,7 +88,9 @@ const EXT_TO_LANG: Readonly<Record<string, string>> = {
   '.ts': 'typescript',
   '.mts': 'typescript',
   '.cts': 'typescript',
-  '.tsx': 'typescript',
+  // .tsx needs its own grammar: the plain TypeScript grammar produces ERROR
+  // nodes on JSX, garbling React component symbols and their CALLS edges.
+  '.tsx': 'tsx',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -107,6 +109,17 @@ interface LanguageConfig {
 const LANGUAGE_CONFIGS: Readonly<Record<string, LanguageConfig>> = {
   typescript: {
     grammarWasm: 'tree-sitter-typescript/tree-sitter-typescript.wasm',
+    symbolQuery: [
+      '(function_declaration name: (identifier) @name) @node',
+      '(class_declaration name: (type_identifier) @name) @node',
+      '(interface_declaration name: (type_identifier) @name) @node',
+      '(method_definition name: (property_identifier) @name) @node',
+    ].join('\n'),
+    callQuery: '(call_expression function: (identifier) @callee) @call',
+  },
+  // TSX shares TypeScript's queries; only the grammar (JSX-aware) differs.
+  tsx: {
+    grammarWasm: 'tree-sitter-typescript/tree-sitter-tsx.wasm',
     symbolQuery: [
       '(function_declaration name: (identifier) @name) @node',
       '(class_declaration name: (type_identifier) @name) @node',
@@ -638,9 +651,18 @@ export async function indexWorkspace(
   };
 
   const embedTasks: { entityId: string; text: string }[] = [];
+  // The walk + parse + persist loop is synchronous per file; without an
+  // explicit yield, indexing a large workspace starves the event loop (every
+  // concurrent MCP request and the admin web UI freeze until it finishes).
+  const yieldToEventLoop = (): Promise<void> => new Promise((resolveYield) => setImmediate(resolveYield));
+  let filesSinceYield = 0;
 
   // Files
   for (const file of walk.files) {
+    if (++filesSinceYield >= 50) {
+      filesSinceYield = 0;
+      await yieldToEventLoop();
+    }
     const pkg = packageFor(file.relPosix, packages);
     const scope = fileScope(projectName, pkg, file.relPosix);
     const id = entityId(scope);

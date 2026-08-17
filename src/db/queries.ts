@@ -264,6 +264,27 @@ export function getEntity(db: SynapseDatabase, id: string): EntityRow | undefine
   return row === undefined ? undefined : entityFromRow(row);
 }
 
+/** Batch variant of {@link getEntity}: one chunked IN(...) query per ~100 ids.
+ *  Unknown ids are simply absent from the returned map. */
+export function getEntities(db: SynapseDatabase, ids: readonly string[]): Map<string, EntityRow> {
+  const out = new Map<string, EntityRow>();
+  const CHUNK = 100;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    /* v8 ignore next -- slice of a bounded loop index is never empty */
+    if (chunk.length === 0) continue;
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = db
+      .prepare(`SELECT * FROM entities WHERE id IN (${placeholders})`)
+      .all(...chunk);
+    for (const row of rows) {
+      const entity = entityFromRow(row);
+      out.set(entity.id, entity);
+    }
+  }
+  return out;
+}
+
 export function getEntityByScope(
   db: SynapseDatabase,
   scopePath: string,
@@ -278,6 +299,9 @@ export function getEntityByScope(
 }
 
 export function deleteEntity(db: SynapseDatabase, id: string): void {
+  // vec_entities is a virtual table without FK support — remove its row
+  // explicitly, then the cascade takes care of entity_vectors/relations.
+  deleteVector(db, id);
   db.prepare('DELETE FROM entities WHERE id = ?').run(id);
 }
 
@@ -400,16 +424,56 @@ export function searchFts(db: SynapseDatabase, text: string, limit: number): Fts
 // Vector store
 // ---------------------------------------------------------------------------
 
-/** Store a Float32Array embedding as a raw BLOB (little-endian float32s). */
+/**
+ * Mirror a BLOB-vector write into the vec_entities KNN table. The BLOB table
+ * stays the source of truth; vec_entities is a derived index that must not
+ * drift. An embedding whose dimension disagrees with the index (user switched
+ * SYNAPSE_EMBEDDING_MODEL mid-database) cannot be stored in the fixed-width
+ * vec0 column — the index disables itself for the rest of the process and the
+ * exact BLOB cosine scan takes over, which skips dimension-mismatched rows.
+ */
+function syncVecIndexUpsert(db: SynapseDatabase, entityId: string, embedding: Float32Array): void {
+  const vec = db.vec;
+  if (vec === undefined || !vec.indexReady) return;
+  if (vec.indexDimension !== null && embedding.length !== vec.indexDimension) {
+    vec.indexReady = false;
+    console.error(
+      `vec_entities index disabled: new embedding has dimension ${embedding.length} but the index was built for ${vec.indexDimension} ` +
+        '(SYNAPSE_EMBEDDING_MODEL changed? rebuild the database or re-index). Falling back to exact cosine scan.',
+    );
+    return;
+  }
+  const buffer = embeddingToBuffer(embedding);
+  const updated = db
+    .prepare('UPDATE vec_entities SET embedding = ? WHERE entity_id = ?')
+    .run(buffer, entityId);
+  if (Number(updated.changes) === 0) {
+    db.prepare('INSERT INTO vec_entities(embedding, entity_id) VALUES (?, ?)').run(buffer, entityId);
+  }
+}
+
+/** Store a Float32Array embedding as a raw BLOB (little-endian float32s) and
+ *  keep the vec_entities KNN index in sync when it is active. */
 export function upsertVector(db: SynapseDatabase, entityId: string, embedding: Float32Array): void {
   db.prepare(
     `INSERT INTO entity_vectors (entity_id, embedding) VALUES (?, ?)
      ON CONFLICT(entity_id) DO UPDATE SET embedding = excluded.embedding`,
   ).run(entityId, embeddingToBuffer(embedding));
+  syncVecIndexUpsert(db, entityId, embedding);
 }
 
 export function deleteVector(db: SynapseDatabase, entityId: string): void {
   db.prepare('DELETE FROM entity_vectors WHERE entity_id = ?').run(entityId);
+  if (db.vec?.indexReady === true) {
+    db.prepare('DELETE FROM vec_entities WHERE entity_id = ?').run(entityId);
+  }
+}
+
+/** Total number of stored BLOB vectors (used to pick exact-scan vs ANN). */
+export function countVectors(db: SynapseDatabase): number {
+  const row = db.prepare('SELECT COUNT(*) AS n FROM entity_vectors').get();
+  /* v8 ignore next -- COUNT(*) always returns exactly one row */
+  return row === undefined ? 0 : num(row, 'n');
 }
 
 function decodeEmbedding(value: unknown): Float32Array {
@@ -470,9 +534,15 @@ export interface SimilarMemoryHit {
  * `memory_entry` so it doesn't scan code/file/symbol entities. The output is
  * ordered by similarity descending and capped at `limit`.
  *
- * Linear scan: there is no ANN index on the BLOB column. Production callers
- * should first check the sqlite-vec ANN index (when loaded) and only fall
- * back to this function when the extension is missing.
+ * `scopePrefixes` (optional) restricts the scan SQL-side with the shared
+ * boundary-aware prefix predicate, so the limit is spent on in-scope
+ * candidates only — a post-hoc filter would let 50 higher-similarity
+ * out-of-scope rows starve the actual winner.
+ *
+ * Rows whose stored dimension disagrees with the query (e.g. the embedding
+ * model changed after older memories were written) are skipped rather than
+ * crashing the whole scan: a dimension-mismatched pair has no meaningful
+ * cosine similarity anyway.
  */
 export function findSimilarMemories(
   db: SynapseDatabase,
@@ -480,27 +550,37 @@ export function findSimilarMemories(
   threshold: number,
   memoryKind: string | null,
   limit: number,
+  scopePrefixes?: readonly string[],
 ): SimilarMemoryHit[] {
   if (embedding.length === 0) return [];
   const norm = l2Norm(embedding);
   if (norm === 0) return [];
-  const kindClause = memoryKind !== null ? ' AND e.memory_kind = ?' : '';
+  const clauses: string[] = [`e.type = 'memory_entry'`];
+  const params: SqlValue[] = [];
+  if (memoryKind !== null) {
+    clauses.push('e.memory_kind = ?');
+    params.push(memoryKind);
+  }
+  if (scopePrefixes !== undefined && scopePrefixes.length > 0) {
+    pushPrefixClause('e.scope_path', scopePrefixes, clauses, params);
+  }
+  clauses.push('(e.expires_at IS NULL OR e.expires_at > ?)');
+  params.push(Date.now());
   // No pre-score LIMIT: every eligible memory_entry vector must be scored
   // before we sort and truncate. A LIMIT applied here would silently miss
   // matching memories outside the arbitrary entity-ID-ordered subset.
-  const params: SqlValue[] = memoryKind !== null ? [memoryKind, Date.now()] : [Date.now()];
   const rows = db
     .prepare(
       `SELECT e.id, e.memory_kind, e.importance, e.scope_path, e.content, e.updated_at, v.embedding
        FROM entity_vectors v
        JOIN entities e ON e.id = v.entity_id
-       WHERE e.type = 'memory_entry'${kindClause}
-         AND (e.expires_at IS NULL OR e.expires_at > ?)`,
+       WHERE ${clauses.join(' AND ')}`,
     )
     .all(...params);
   const hits: SimilarMemoryHit[] = [];
   for (const row of rows) {
     const other = decodeEmbedding(row['embedding']);
+    if (other.length !== embedding.length) continue; // dimension mismatch: skip
     const sim = cosineSimilarity(embedding, other);
     if (sim >= threshold) {
       hits.push({
@@ -759,6 +839,7 @@ export function findMemories(
     params.push(now);
   }
 
+  /* v8 ignore next -- the type clause is pushed unconditionally above, so the empty arm is structurally dead */
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(limit);
   const rows = db

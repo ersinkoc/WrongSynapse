@@ -23,6 +23,7 @@ import { z } from 'zod';
 
 import {
   getCandidate,
+  getEntities,
   getEntity,
   getEntityByScope,
   getGraphPath,
@@ -42,7 +43,7 @@ import {
 
 import { hybridSearch } from '../../engine/hybrid-search.js';
 import { indexWorkspace } from '../../engine/parser.js';
-import { parseScope, scopeMatchesAnyPrefix } from '../../utils/scope.js';
+import { parseScope } from '../../utils/scope.js';
 import { jsonResult, type ToolArgs, type ToolContext, type ToolDefinition } from './index.js';
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,17 @@ function stringArray(value: unknown): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) throw new Error('expected an array of strings');
   return value.filter((item): item is string => typeof item === 'string');
+}
+
+/**
+ * Parse a `scopes` argument upfront. An invalid scope would otherwise surface
+ * mid-pipeline (scopeMatchesAnyPrefix → parseScope throws deep inside hybrid
+ * search / the web handler's 500) instead of as a clean parameter error.
+ */
+function validatedScopes(value: unknown): string[] {
+  const scopes = stringArray(value);
+  for (const scope of scopes) parseScope(scope);
+  return scopes;
 }
 
 function numberArg(value: unknown, fallback: number, min = -Infinity, max = Infinity): number {
@@ -140,7 +152,7 @@ const indexWorkspaceTool: ToolDefinition = {
       workspacePath,
       parseAst: typeof options['parse_ast'] === 'boolean' ? options['parse_ast'] : undefined,
       includeGitHistory: typeof options['include_git_history'] === 'boolean' ? options['include_git_history'] : undefined,
-      depth: typeof options['depth'] === 'number' ? options['depth'] : undefined,
+      depth: intArg(options['depth'], 20, 1, 64),
     });
     return jsonResult(result);
   },
@@ -169,7 +181,7 @@ const hybridQueryTool: ToolDefinition = {
   }),
   handler: async (ctx, args) => {
     const query = requireString(args, 'query');
-    const scopes = stringArray(args['scopes']);
+    const scopes = validatedScopes(args['scopes']);
     const types = stringArray(args['types']);
     const limit = intArg(args['limit'], 10, 1, 50);
     const vectorWeight = numberArg(args['vector_weight'], 1, 0, 10);
@@ -290,11 +302,13 @@ const graphNeighborsTool: ToolDefinition = {
     // Traverse by the RESOLVED id: when the caller passed a scope path, the
     // raw input is a URI, not a primary key.
     const neighbors = getNeighbors(ctx.db, entity.id, { depth, direction, relationFilter });
+    // One chunked fetch for every neighbor instead of a SELECT per row.
+    const neighborEntityById = getEntities(ctx.db, neighbors.map((neighbor) => neighbor.entityId));
     const neighborRows = neighbors.map((neighbor) => {
       // Relations are FK-bound to entities (cascade delete), so the neighbor
       // row always resolves; the lookup and its null fallbacks are defensive.
       /* v8 ignore start */
-      const neighborEntity = getEntity(ctx.db, neighbor.entityId);
+      const neighborEntity = neighborEntityById.get(neighbor.entityId);
       return {
         entity_id: neighbor.entityId,
         name: neighborEntity?.name ?? null,
@@ -506,7 +520,7 @@ const rememberTool: ToolDefinition = {
     // retrieval can still resolve the old id.
     let mergedInto: string | null = null;
     let mergedSimilarity: number | null = null;
-    if (embedError === null && ctx.embedder !== undefined) {
+    if (embedError === null) {
       try {
         const winnerEmbedding = await ctx.embedder.embed(text);
         // Exclude the new id from the search — the new memory is guaranteed to
@@ -519,22 +533,18 @@ const rememberTool: ToolDefinition = {
         // ANCHORED_TO edge against a scope the new memory never referenced —
         // callers that stored the original under that scope would lose its
         // anchor. scopeMatchesAnyPrefix is a single-prefix check here.
-        const hits = findSimilarMemories(ctx.db, winnerEmbedding, 0.85, memoryKind, 50);
-        // Scope filter: only merge into a winner that shares the new memory's
-        // targetScope prefix. Merging across scopes would archive the loser's
-        // ANCHORED_TO edge against a scope the new memory never referenced —
-        // callers that stored the original under that scope would lose its
-        // anchor. Delegate to the shared boundary-aware helper in
-        // src/utils/scope.ts (the same one hybrid-search uses for its
-        // segment-aware re-check) so this check and the SQL range predicate
-        // stay aligned: equal scope OR descendant OR ancestor. Self-exclusion
-        // is handled separately via hit.entityId !== id.
-        const winner = hits.find(
-          (hit) =>
-            hit.entityId !== id &&
-            scopeMatchesAnyPrefix(hit.scopePath, [targetScope]),
-        );
+        const hits = findSimilarMemories(ctx.db, winnerEmbedding, 0.85, memoryKind, 50, [targetScope]);
+        // Scope filter: the SQL scan above is already boundary-aware scope
+        // filtered (equal scope OR descendant OR ancestor — the same predicate
+        // hybrid-search uses), so only self-exclusion remains here. Merging
+        // across scopes would archive the loser's ANCHORED_TO edge against a
+        // scope the new memory never referenced — callers that stored the
+        // original under that scope would lose its anchor.
+        const winner = hits.find((hit) => hit.entityId !== id);
         if (winner !== undefined) {
+          // mergeMemories returns false only for missing/same ids, which the
+          // find above already excluded.
+          /* v8 ignore next */
           if (mergeMemories(ctx.db, winner.entityId, id)) {
             mergedInto = winner.entityId;
             mergedSimilarity = winner.similarity;
@@ -576,7 +586,7 @@ const recallTool: ToolDefinition = {
     limit: z.number().int().positive().describe('Maximum results (default 20, max 200).').optional(),
   }),
   handler: async (ctx, args) => {
-    const scopes = stringArray(args['scopes']);
+    const scopes = validatedScopes(args['scopes']);
     const memoryKinds = (args['memory_kinds'] as unknown as string[] | undefined)?.map(memoryKindOf) ?? [];
     const importanceMin = numberArg(args['importance_min'], 0, 0, 1);
     const tags = stringArray(args['tags']);
@@ -625,7 +635,7 @@ const searchTool: ToolDefinition = {
   }),
   handler: async (ctx, args) => {
     const query = requireString(args, 'query');
-    const scopes = stringArray(args['scopes']);
+    const scopes = validatedScopes(args['scopes']);
     const memoryKinds = (args['memory_kinds'] as unknown as string[] | undefined)?.map(memoryKindOf) ?? [];
     const types = stringArray(args['types']);
     const limit = intArg(args['limit'], 10, 1, 50);

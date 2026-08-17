@@ -54,6 +54,23 @@ CREATE INDEX IF NOT EXISTS idx_entities_expires ON entities(expires_at);
 CREATE INDEX IF NOT EXISTS idx_entities_last_accessed ON entities(last_accessed_at);
 `;
 
+/**
+ * v4: re-scope the FTS5 update trigger to the indexed columns only.
+ *
+ * The v1 trigger fired on EVERY entity UPDATE, so access tracking
+ * (touchMemory's last_accessed_at bump) deleted + reinserted the FTS row for
+ * each recalled memory — up to hundreds of FTS writes per search. With
+ * `AFTER UPDATE OF name, content, scope_path` the rewrite happens only when
+ * an indexed column actually changes.
+ */
+const MIGRATION_V4_FTS_UPDATE_TRIGGER = `
+DROP TRIGGER IF EXISTS entities_au;
+CREATE TRIGGER entities_au AFTER UPDATE OF name, content, scope_path ON entities BEGIN
+  INSERT INTO entities_fts(entities_fts, rowid, name, content, scope_path) VALUES('delete', old.rowid, old.name, old.content, old.scope_path);
+  INSERT INTO entities_fts(rowid, name, content, scope_path) VALUES (new.rowid, new.name, new.content, new.scope_path);
+END;
+`;
+
 const MIGRATION_V1 = `
 -- 1. UNIFIED ENTITY HIERARCHY
 CREATE TABLE IF NOT EXISTS entities (
@@ -129,7 +146,12 @@ CREATE INDEX IF NOT EXISTS idx_memory_candidates_status ON memory_candidates(sta
 -- Executed in migrate() after all prior migrations.
 `;
 
-export const MIGRATIONS: readonly string[] = [MIGRATION_V1, MIGRATION_V2_MEMORY_FIELDS_STATIC, MIGRATION_V3_MEMORY_INDEX];
+export const MIGRATIONS: readonly string[] = [
+  MIGRATION_V1,
+  MIGRATION_V2_MEMORY_FIELDS_STATIC,
+  MIGRATION_V3_MEMORY_INDEX,
+  MIGRATION_V4_FTS_UPDATE_TRIGGER,
+];
 
 export const SCHEMA_VERSION: number = MIGRATIONS.length;
 

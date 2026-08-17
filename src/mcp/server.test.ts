@@ -320,3 +320,18 @@ describe('runStdio', () => {
     await expect(runStdio(ctx)).resolves.toBeUndefined();
   });
 });
+
+describe('runSse listen failures', () => {
+  it('rejects (instead of crashing the event loop) when the port is already in use', async () => {
+    // Occupy a port, then attempt runSse on it — the 'error' listener must
+    // turn the EADDRINUSE into a rejected boot promise.
+    const squatter = http.createServer();
+    await new Promise<void>((resolveListen) => squatter.listen(0, '127.0.0.1', () => resolveListen()));
+    const port = (squatter.address() as AddressInfo).port;
+    try {
+      await expect(runSse(ctx, port, '127.0.0.1')).rejects.toThrow(/EADDRINUSE|in use/i);
+    } finally {
+      await new Promise<void>((resolveClose) => squatter.close(() => resolveClose()));
+    }
+  });
+});

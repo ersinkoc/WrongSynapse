@@ -53,6 +53,38 @@ describe('migrations', () => {
     expect(fts).toBeDefined();
   });
 
+  it('v4: scopes the FTS update trigger to the indexed columns only', async () => {
+    // The v1 trigger fired on EVERY update; v4 must replace it with an
+    // AFTER UPDATE OF (name, content, scope_path) variant so access tracking
+    // (last_accessed_at) does not rewrite the FTS row.
+    const trigger = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'entities_au'")
+      .get() as { sql: string };
+    expect(trigger.sql).toContain('AFTER UPDATE OF name, content, scope_path');
+    // touchMemory must not churn FTS: capture the FTS row's state, touch,
+    // confirm the entity updated but the FTS row was NOT deleted/reinserted.
+    const { touchMemory } = await import('./queries.js');
+    insertEntity(db, { id: 'v4mem', type: 'memory_entry', scopePath: 'proj:t/file:v4.ts', name: 'v4', content: 'fts churn probe' });
+    const before = db.prepare("SELECT count(*) AS n FROM entities_fts WHERE entities_fts MATCH 'churn'").get() as { n: number };
+    expect(before.n).toBe(1);
+    touchMemory(db, 'v4mem');
+    const after = db.prepare("SELECT count(*) AS n FROM entities_fts WHERE entities_fts MATCH 'churn'").get() as { n: number };
+    expect(after.n).toBe(1); // still indexed, row was not cycled
+    const entity = getEntity(db, 'v4mem');
+    expect(entity?.lastAccessedAt).not.toBeNull();
+  });
+
+  it('v2 idempotency arm: an empty dynamic SQL batch still advances the version', () => {
+    // A database sitting at version 1 whose v2 columns all exist must bump
+    // user_version without executing any SQL (the `sql.trim().length > 0`
+    // false arm).
+    const row = db.prepare('PRAGMA user_version').get();
+    expect(row?.['user_version']).toBe(SCHEMA_VERSION); // all migrations ran
+    db.exec('PRAGMA user_version = 1'); // rewind to force the v2 loop pass
+    migrate(db);
+    expect(db.prepare('PRAGMA user_version').get()?.['user_version']).toBe(SCHEMA_VERSION);
+  });
+
   it('is idempotent — calling migrate again does not error on partial state', () => {
     // Simulate a PARTIAL v2 migration: `memory_kind` was added on a previous
     // boot but the rest of the v2 columns never landed (e.g. process crashed

@@ -209,3 +209,22 @@ describe('hybridSearch — semantic scan cap', () => {
     }
   });
 });
+
+describe('hybridSearch — graph channel with no seeds', () => {
+  it('skips graph expansion entirely when no channel produced candidates', async () => {
+    // A database with one FTS-matching-less entity and zero vectors: both
+    // ranked lists come back empty, so the graph branch has no seeds and
+    // must no-op instead of consulting the relations table.
+    const emptyDb = await openDatabase(':memory:');
+    migrate(emptyDb);
+    try {
+      insertEntity(emptyDb, { id: 'lonely', type: 'file', scopePath: 'proj:empty/file:lonely.ts', name: 'lonely.ts', content: 'zzz nothing here' });
+      const out = await hybridSearch(emptyDb, embedder, { query: 'zzzzzqqq no match anywhere', limit: 5 });
+      expect(out.results).toEqual([]);
+      expect(out.vectorRetrievalUsed).toBe(true); // the scan ran over zero vectors
+      expect(out.warnings).toEqual([]);
+    } finally {
+      emptyDb.close();
+    }
+  });
+});

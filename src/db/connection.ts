@@ -67,8 +67,12 @@ function mapAll(rows: unknown[]): Record<string, unknown>[] {
 }
 
 export interface VecCapabilities {
-  hnswEnabled: boolean;
-  hnswBuildComplete: boolean;
+  /** sqlite-vec extension loaded into the connection. */
+  extensionLoaded: boolean;
+  /** `vec_entities` virtual table built and kept in sync — usable for KNN. */
+  indexReady: boolean;
+  /** Dimension of the embeddings held by `vec_entities` (null before build). */
+  indexDimension: number | null;
 }
 
 /**
@@ -81,100 +85,138 @@ async function tryLoadVecExtension(db: BetterDatabaseLike): Promise<VecCapabilit
     const { getLoadablePath } = await import('sqlite-vec');
     const path = getLoadablePath();
     db.loadExtension(path);
-    return { hnswEnabled: true, hnswBuildComplete: false };
-  } catch {
-    return { hnswEnabled: false, hnswBuildComplete: false };
+    return { extensionLoaded: true, indexReady: false, indexDimension: null };
+  } catch (error) {
+    console.error(
+      `sqlite-vec extension unavailable (semantic search degrades to exact cosine scan): ${describeError(error)}`,
+    );
+    return { extensionLoaded: false, indexReady: false, indexDimension: null };
   }
 }
 
+/** Default vec0 column width when the database has no vectors yet (matches
+ *  the default embedding model, all-MiniLM-L6-v2). */
+export const DEFAULT_VEC_DIMENSION = 384;
+
 /**
- * Build HNSW indexes for all existing vectors in entity_vectors.
- * Migrates BLOB vectors → sqlite-vec HNSW virtual table. Safe to call multiple
- * times (checks build marker before rebuilding). Marks hnswBuildComplete on the
- * passed db object when complete.
+ * Build the `vec_entities` vec0 virtual table from the BLOB vectors in
+ * `entity_vectors`, so hybrid search can use sqlite-vec's native KNN instead
+ * of a full-table cosine scan. sqlite-vec 0.1.x is brute-force KNN (no HNSW);
+ * the vec0 table exists to push the scan into C and keep runtime writes in
+ * sync (queries.ts mirrors upserts/deletes into it).
  *
- * Schema: vec_entities uses `entity_id TEXT` as a metadata column (indexed), so
- * sqlite-vec can filter by it during KNN without a JOIN. The entity_id is stable
- * (UUID, never changes) — no rowid dependency.
+ * Skips the rebuild when the build marker matches the schema version AND the
+ * indexed row count matches `entity_vectors` (runtime sync keeps the counts
+ * aligned, so a mismatch means a stale or failed index). Returns true when
+ * `vec_entities` is usable; on any failure the partial table is dropped,
+ * `db.vec.indexReady` stays false, and callers fall back to BLOB cosine
+ * search — which is exactly what hybrid-search.ts checks.
+ *
+ * Requires the entities/entity_vectors tables to exist (call after migrate()).
  */
-export function buildHnswIndexes(db: SynapseDatabase): void {
-  // Ensure the build-marker table exists (idempotent). Tracks whether the HNSW
-  // index has been built for the current schema. If the schema version bumps we
-  // delete the marker so the next call rebuilds.
+export function buildVecIndex(db: SynapseDatabase): boolean {
   db.exec(
     'CREATE TABLE IF NOT EXISTS _synapse_vec_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);',
   );
-  // Always check schema version — if it changed, force a rebuild.
+  const metaGet = (key: string): string | undefined => {
+    const row = db
+      .prepare('SELECT value FROM _synapse_vec_meta WHERE key = ?')
+      .get(key) as { value: string } | undefined;
+    return row?.value;
+  };
   const schemaVersion = String(SCHEMA_VERSION);
-  const marker = db
-    .prepare("SELECT value FROM _synapse_vec_meta WHERE key = 'hnsw_built_for'")
-    .get() as { value: string } | undefined;
+  const marker = metaGet('vec_index_built_for');
+  const storedCount = Number(metaGet('vec_index_count') ?? '-1');
+  const storedDim = Number(metaGet('vec_index_dim') ?? '0');
+  // COUNT(*) always returns exactly one row; the ?? 0 is a typing nicety.
+  /* v8 ignore next */
+  const blobCount = (
+    db.prepare('SELECT COUNT(*) AS n FROM entity_vectors').get() as { n: number } | undefined
+  )?.n ?? 0;
+  const tableExists =
+    db
+      .prepare("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'vec_entities'")
+      .get() !== undefined;
 
-  const count = db
-    .prepare('SELECT COUNT(*) AS n FROM entity_vectors')
-    .get() as { n: number } | undefined;
-  const totalVectors = count?.n ?? 0;
+  if (marker === schemaVersion && tableExists && storedCount === blobCount) {
+    // Index is fresh: runtime sync in queries.ts has kept it aligned.
+    if (db.vec !== undefined) {
+      db.vec.indexReady = true;
+      db.vec.indexDimension = storedDim > 0 ? storedDim : null;
+    }
+    return true;
+  }
 
-  // Skip rebuild if the index already exists, the schema matches, and there are
-  // no new vectors to insert. (We always check the count below to pick up new
-  // vectors inserted since the last build.)
-  if (marker?.value === schemaVersion && totalVectors === 0) return;
-
-  // Wrap the rest in try/catch so a sqlite-vec build failure (e.g. extension
-  // missing on a new machine) can't take down the whole server. The fallback
-  // BLOB cosine search in hybrid-search.ts is still available.
   try {
-    // Drop and recreate to pick up any schema changes; IF NOT EXISTS alone is not
-    // enough since the column list might have changed across rebuilds.
-    db.exec('DROP TABLE IF EXISTS vec_entities');
-
-    // entity_id as a TEXT metadata column lets sqlite-vec apply the filter during
-    // the KNN search (no post-hoc JOIN needed in hybrid-search hot path).
-    db.exec(`
-    CREATE VIRTUAL TABLE vec_entities USING vec0(
-      embedding float[384],
-      entity_id text,
-      hnsw_parameters(m=16, ef_construction=200)
-    );
-  `);
-
-    // ORDER BY entity_id ensures deterministic iteration across rebuilds.
-    const rows = db
-      .prepare(
-        'SELECT entity_id, embedding FROM entity_vectors ORDER BY entity_id LIMIT 100000',
-      )
-      .all() as { entity_id: string; embedding: Uint8Array }[];
-
-    const insert = db.prepare(
-      'INSERT INTO vec_entities(embedding, entity_id) VALUES (?, ?)',
-    );
-    for (const row of rows) {
-      insert.run(JSON.stringify([...bufferToFloats(row.embedding)]), row.entity_id);
+    // Derive the column width from the stored vectors so a non-default
+    // embedding model still gets a matching vec0 table. All rows must share
+    // the same dimension — a mixed-dimension corpus (user switched
+    // SYNAPSE_EMBEDDING_MODEL) cannot be indexed; disable instead of
+    // silently dropping rows.
+    const first = db
+      .prepare('SELECT embedding FROM entity_vectors ORDER BY entity_id LIMIT 1')
+      .get() as { embedding: Uint8Array } | undefined;
+    const dim = first !== undefined ? first.embedding.byteLength / 4 : DEFAULT_VEC_DIMENSION;
+    if (!Number.isInteger(dim) || dim <= 0) {
+      // `?? 0`: first is undefined only on the DEFAULT arm above, where dim
+      // is a valid constant — the fallback is unreachable typing hygiene.
+      /* v8 ignore next */
+      throw new Error(`cannot derive embedding dimension from stored vectors (${first?.embedding.byteLength ?? 0} bytes)`);
     }
 
-    // Mark the build complete for this schema version.
-    db.prepare(
-      "INSERT INTO _synapse_vec_meta(key, value) VALUES('hnsw_built_for', ?) " +
-        'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-    ).run(schemaVersion);
+    db.transaction(() => {
+      db.exec('DROP TABLE IF EXISTS vec_entities');
+      db.exec(`CREATE VIRTUAL TABLE vec_entities USING vec0(embedding float[${dim}], entity_id text)`);
+      const rows = db
+        .prepare('SELECT entity_id, embedding FROM entity_vectors ORDER BY entity_id')
+        .all() as { entity_id: string; embedding: Uint8Array }[];
+      const insert = db.prepare('INSERT INTO vec_entities(embedding, entity_id) VALUES (?, ?)');
+      for (const row of rows) {
+        if (row.embedding.byteLength / 4 !== dim) {
+          throw new Error(
+            `mixed embedding dimensions in entity_vectors (${dim} vs ${row.embedding.byteLength / 4}); ` +
+              'delete the database or re-index before enabling the vector index',
+          );
+        }
+        // entity_vectors stores little-endian float32 BLOBs — exactly the
+        // packed format vec0 accepts, so no re-serialization is needed.
+        insert.run(row.embedding, row.entity_id);
+      }
+      db.prepare(
+        "INSERT INTO _synapse_vec_meta(key, value) VALUES('vec_index_built_for', ?) " +
+          'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      ).run(schemaVersion);
+      db.prepare(
+        "INSERT INTO _synapse_vec_meta(key, value) VALUES('vec_index_count', ?) " +
+          'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      ).run(String(rows.length));
+      db.prepare(
+        "INSERT INTO _synapse_vec_meta(key, value) VALUES('vec_index_dim', ?) " +
+          'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      ).run(String(dim));
+    });
+    if (db.vec !== undefined) {
+      db.vec.indexReady = true;
+      db.vec.indexDimension = dim;
+    }
+    return true;
   } catch (error) {
-    // Log but don't throw — the caller will fall back to BLOB cosine search.
-    // Re-running this function on the next boot will retry the build.
-    db.exec('DROP TABLE IF EXISTS vec_entities');
-    db.exec(
-      "DELETE FROM _synapse_vec_meta WHERE key = 'hnsw_built_for'",
-    );
+    // Log but don't throw — callers fall back to BLOB cosine search and the
+    // next boot retries the build.
+    try {
+      db.exec('DROP TABLE IF EXISTS vec_entities');
+      db.exec("DELETE FROM _synapse_vec_meta WHERE key LIKE 'vec_index_%'");
+    } catch {
+      // secondary failure while cleaning up: nothing further to do
+    }
+    // Defensive: mocked test databases have no vec capability object.
+    /* v8 ignore next */
+    if (db.vec !== undefined) db.vec.indexReady = false;
     console.error(
-      `buildHnswIndexes failed (falling back to BLOB cosine search): ${describeError(error)}`,
+      `buildVecIndex failed (falling back to BLOB cosine search): ${describeError(error)}`,
     );
+    return false;
   }
-}
-
-function bufferToFloats(buf: Uint8Array): Float32Array {
-  const floats = new Float32Array(buf.length / 4);
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  for (let i = 0; i < floats.length; i++) floats[i] = view.getFloat32(i * 4, true);
-  return floats;
 }
 
 export function describeError(error: unknown): string {
@@ -198,7 +240,30 @@ interface BetterDatabaseLike {
   loadExtension(path: string, entrypoint?: string): void;
 }
 
-async function createBetterSqlite(dbPath: string): Promise<SynapseDatabase> {
+/**
+ * Per-connection prepared-statement cache. SQL compilation is the dominant
+ * fixed cost in the hot paths (every queries.ts call previously re-prepared),
+ * and better-sqlite3/node:sqlite statements are safe to reuse until closed.
+ *
+ * Bounded: dynamic SQL (IN-list lengths, scope-prefix OR groups) produces an
+ * unbounded key space, so the cache resets wholesale when it overflows —
+ * amortized O(1) with a hard memory ceiling.
+ */
+const STATEMENT_CACHE_MAX = 512;
+
+function createStatementCache<S>(compile: (sql: string) => S): (sql: string) => S {
+  const cache = new Map<string, S>();
+  return (sql: string): S => {
+    const cached = cache.get(sql);
+    if (cached !== undefined) return cached;
+    if (cache.size >= STATEMENT_CACHE_MAX) cache.clear();
+    const stmt = compile(sql);
+    cache.set(sql, stmt);
+    return stmt;
+  };
+}
+
+async function createBetterSqlite(dbPath: string): Promise<{ db: SynapseDatabase; raw: BetterDatabaseLike }> {
   // Dynamic import: a missing/broken native binding fails here, not at module
   // load, so the node:sqlite fallback can still be attempted.
   const mod = await import('better-sqlite3');
@@ -211,16 +276,21 @@ async function createBetterSqlite(dbPath: string): Promise<SynapseDatabase> {
     get: (...params: SqlValue[]) => toRecord(stmt.get(...params)),
     all: (...params: SqlValue[]) => mapAll(stmt.all(...params)),
   });
-  return {
+  const cached = createStatementCache((sql: string) => wrapStatement(raw.prepare(sql)));
+  const db: SynapseDatabase = {
     backend: 'better-sqlite3',
     path: dbPath,
     exec: (sql: string) => {
       raw.exec(sql);
     },
-    prepare: (sql: string) => wrapStatement(raw.prepare(sql)),
+    prepare: (sql: string) => cached(sql),
     transaction: <T>(fn: () => T): T => raw.transaction(fn)(),
     close: () => raw.close(),
   };
+  // The raw handle travels alongside the wrapper: loadExtension exists only
+  // on the driver's own Database object, and passing the wrapper here meant
+  // the sqlite-vec extension silently never loaded.
+  return { db, raw };
 }
 
 // ---- node:sqlite backend ----------------------------------------------------
@@ -246,13 +316,14 @@ async function createNodeSqlite(dbPath: string): Promise<SynapseDatabase> {
     get: (...params: SqlValue[]) => toRecord(stmt.get(...params)),
     all: (...params: SqlValue[]) => mapAll(stmt.all(...params)),
   });
+  const cached = createStatementCache((sql: string) => wrapStatement(raw.prepare(sql)));
   return {
     backend: 'node:sqlite',
     path: dbPath,
     exec: (sql: string) => {
       raw.exec(sql);
     },
-    prepare: (sql: string) => wrapStatement(raw.prepare(sql)),
+    prepare: (sql: string) => cached(sql),
     transaction: <T>(fn: () => T): T => {
       raw.exec('BEGIN');
       try {
@@ -276,14 +347,17 @@ async function createNodeSqlite(dbPath: string): Promise<SynapseDatabase> {
 export async function openDatabase(dbPath: string): Promise<SynapseDatabase & { vec: VecCapabilities }> {
   let betterError: unknown;
   try {
-    const db = await createBetterSqlite(dbPath);
-    const vec = await tryLoadVecExtension(db as unknown as BetterDatabaseLike);
+    const { db, raw } = await createBetterSqlite(dbPath);
+    // Extension loading needs the RAW driver handle (see createBetterSqlite).
+    const vec = await tryLoadVecExtension(raw);
     return Object.assign(db, { vec });
   } catch (error) {
     betterError = error;
   }
   try {
-    return Object.assign(await createNodeSqlite(dbPath), { vec: { hnswEnabled: false, hnswBuildComplete: false } });
+    return Object.assign(await createNodeSqlite(dbPath), {
+      vec: { extensionLoaded: false, indexReady: false, indexDimension: null },
+    });
   } catch (error) {
     throw new Error(
       `No usable SQLite driver for '${dbPath}'. better-sqlite3 failed: ` +

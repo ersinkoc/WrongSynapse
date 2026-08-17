@@ -26,6 +26,7 @@ import type { Embedder } from '../engine/embedding.js';
 import {
   route,
   routeAsync,
+  isAllowedHostHeader,
   resolveStaticFile,
   resolveSpaFallback,
   runWebServer,
@@ -1050,5 +1051,75 @@ describe('routeAsync — GET /api/search', () => {
     expect(missing!.status).toBe(404);
     const spa = await routeAsync({ method: 'GET', rawUrl: '/some/static/path' }, searchCtx);
     expect(spa).toBeNull();
+  });
+});
+
+describe('Host-header allow-list (DNS-rebinding defense)', () => {
+  it('accepts loopback hostnames with and without ports', () => {
+    expect(isAllowedHostHeader('127.0.0.1:50999')).toBe(true);
+    expect(isAllowedHostHeader('127.0.0.1')).toBe(true);
+    expect(isAllowedHostHeader('localhost:3000')).toBe(true);
+    expect(isAllowedHostHeader('LOCALHOST:3000')).toBe(true);
+    expect(isAllowedHostHeader('[::1]:50999')).toBe(true);
+    expect(isAllowedHostHeader('::1')).toBe(true);
+  });
+
+  it('rejects absent, empty, and non-loopback hosts (rebinding payloads)', () => {
+    expect(isAllowedHostHeader(undefined)).toBe(false);
+    expect(isAllowedHostHeader('')).toBe(false);
+    expect(isAllowedHostHeader('evil.example.com:50999')).toBe(false);
+    expect(isAllowedHostHeader('10.0.0.5:50999')).toBe(false);
+    expect(isAllowedHostHeader('127.0.0.1.evil.example.com')).toBe(false);
+    expect(isAllowedHostHeader('[::ffff:10.0.0.5]:80')).toBe(false);
+  });
+
+  it('403s an HTTP request whose Host header is not a loopback name', async () => {
+    const handle = await runWebServer({ db }, 0);
+    try {
+      const res = await new Promise<{ status: number; body: string }>((resolveRequest, rejectRequest) => {
+        const req = http.request(
+          { host: '127.0.0.1', port: handle.port, path: '/api/stats', method: 'GET', headers: { host: 'evil.example.com' } },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolveRequest({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+          },
+        );
+        req.on('error', rejectRequest);
+        req.end();
+      });
+      expect(res.status).toBe(403);
+      expect(res.body).toContain('forbidden');
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it('sends baseline security headers on API responses and CSP on the SPA shell', async () => {
+    const handle = await runWebServer({ db, staticDir: httpShellDir }, 0);
+    try {
+      const api = await httpRequest(handle.port, '/api/health');
+      expect(api.headers['x-content-type-options']).toBe('nosniff');
+
+      const html = await httpRequest(handle.port, '/');
+      expect(html.headers['x-content-type-options']).toBe('nosniff');
+      expect(html.headers['x-frame-options']).toBe('DENY');
+      expect(String(html.headers['content-security-policy'])).toContain("default-src 'self'");
+
+      // Non-HTML assets get the baseline headers but not the HTML-only CSP.
+      const js = await httpRequest(handle.port, '/app.js');
+      expect(js.headers['x-content-type-options']).toBe('nosniff');
+      expect(js.headers['x-frame-options']).toBeUndefined();
+      expect(js.headers['content-security-policy']).toBeUndefined();
+
+      // A direct /index.html request goes through the ASSET branch (not the
+      // SPA fallback) and must receive the HTML hardening headers too.
+      const htmlAsset = await httpRequest(handle.port, '/index.html');
+      expect(htmlAsset.status).toBe(200);
+      expect(htmlAsset.headers['x-frame-options']).toBe('DENY');
+      expect(String(htmlAsset.headers['content-security-policy'])).toContain("default-src 'self'");
+    } finally {
+      await handle.close();
+    }
   });
 });

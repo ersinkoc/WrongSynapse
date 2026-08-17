@@ -53,10 +53,11 @@ const mocks = vi.hoisted(() => {
     embeddingsStored: 1,
     warnings: [],
   }));
-  return { runStdio, runSse, openDatabase, migrate, assertFts5, dbStats, getSharedEmbedder, indexWorkspace };
+  const buildVecIndex = vi.fn(() => true);
+  return { runStdio, runSse, openDatabase, migrate, assertFts5, dbStats, getSharedEmbedder, indexWorkspace, buildVecIndex };
 });
 
-vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase }));
+vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase, buildVecIndex: mocks.buildVecIndex }));
 // Partial fs mock: realpathSync DEFAULTS to the real implementation; only the
 // isMainEntryPoint case-fold test swaps in an identity resolver, so differently-
 // cased paths stay "resolvable" on every host filesystem (Linux CI cannot
@@ -192,7 +193,12 @@ describe('CLI main()', () => {
 
   it('starts the SSE server with --transport sse and --port', async () => {
     await main(['--transport', 'sse', '--port', '9999']);
-    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 9999);
+    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 9999, '127.0.0.1');
+  });
+
+  it('binds the SSE server to an explicit --sse-host', async () => {
+    await main(['--transport', 'sse', '--port', '9997', '--sse-host', '0.0.0.0']);
+    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 9997, '0.0.0.0');
   });
 
   it('rejects an invalid SSE port', async () => {
@@ -208,7 +214,7 @@ describe('CLI main()', () => {
   it('resolves the SSE port from SYNAPSE_PORT when the flag is absent', async () => {
     vi.stubEnv('SYNAPSE_PORT', '9123');
     await main(['--transport', 'sse']);
-    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 9123);
+    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 9123, '127.0.0.1');
   });
 
   it('names SYNAPSE_PORT as the source when the env port is invalid', async () => {
@@ -218,7 +224,7 @@ describe('CLI main()', () => {
 
   it('uses the default port when neither flag nor env is set', async () => {
     await main(['--transport', 'sse']);
-    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 8765);
+    expect(mocks.runSse).toHaveBeenCalledWith(expect.anything(), 8765, '127.0.0.1');
   });
 
   it('treats an empty --model-dir as absent (auto mode: undefined pins nothing)', async () => {
@@ -272,6 +278,36 @@ describe('CLI main()', () => {
       log.mockRestore();
     }
   });
+
+  it('builds the vec index at boot only when the extension loaded and the index is stale', async () => {
+    mocks.buildVecIndex.mockClear();
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
+      transaction: <T>(fn: () => T): T => fn(), close: vi.fn(),
+      vec: { extensionLoaded: true, indexReady: false, indexDimension: null },
+    } as never);
+    await main(['--index', '/tmp/ws']);
+    expect(mocks.buildVecIndex).toHaveBeenCalledTimes(1);
+
+    mocks.buildVecIndex.mockClear();
+    mocks.openDatabase.mockResolvedValueOnce({
+      backend: 'better-sqlite3', path: ':memory:', exec: vi.fn(), prepare: vi.fn(),
+      transaction: <T>(fn: () => T): T => fn(), close: vi.fn(),
+      vec: { extensionLoaded: true, indexReady: true, indexDimension: 384 },
+    } as never);
+    await main(['--index', '/tmp/ws']);
+    expect(mocks.buildVecIndex).not.toHaveBeenCalled();
+  });
+
+  it('logs the resolved database path at boot so CWD-relative defaults are visible', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await main(['--index', '/tmp/ws']);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('WrongSynapse database:'));
+    } finally {
+      error.mockRestore();
+    }
+  });
 });
 
 describe('entry-point auto-run branch (module re-import)', () => {
@@ -285,6 +321,7 @@ describe('entry-point auto-run branch (module re-import)', () => {
   let onSpy: ReturnType<typeof vi.spyOn>;
   let sigintHandler: ((...args: unknown[]) => void) | undefined;
   let sigtermHandler: ((...args: unknown[]) => void) | undefined;
+  let unhandledRejectionHandler: ((...args: unknown[]) => void) | undefined;
 
   beforeAll(() => {
     realArgv = [...process.argv];
@@ -296,6 +333,7 @@ describe('entry-point auto-run branch (module re-import)', () => {
         ((event: string, cb: (...a: unknown[]) => void) => {
           if (event === 'SIGINT') sigintHandler = cb;
           if (event === 'SIGTERM') sigtermHandler = cb;
+          if (event === 'unhandledRejection') unhandledRejectionHandler = cb;
           return process;
         }) as never,
       );
@@ -310,6 +348,7 @@ describe('entry-point auto-run branch (module re-import)', () => {
     process.argv = [...realArgv];
     sigintHandler = undefined;
     sigtermHandler = undefined;
+    unhandledRejectionHandler = undefined;
   }
 
   /** Force the entry branch: argv[1] = this module, empty flag tail. */
@@ -367,7 +406,7 @@ describe('entry-point auto-run branch (module re-import)', () => {
     try {
       vi.resetModules();
       await import('./index.js');
-      await vi.waitFor(() => expect(error).toHaveBeenCalledWith('boot failure'), { timeout: 1000 });
+      await vi.waitFor(() => expect(error).toHaveBeenCalledWith(expect.stringContaining('boot failure')), { timeout: 1000 });
       expect(exit).toHaveBeenCalledWith(1);
     } finally {
       error.mockRestore();
@@ -480,6 +519,65 @@ describe('entry-point auto-run branch (module re-import)', () => {
       error.mockRestore();
       exit.mockRestore();
       reset();
+    }
+  });
+
+  it('falls back to the message when a rejected Error has no stack', async () => {
+    forceEntryArgv();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    const stackless = new Error('stackless boot failure');
+    stackless.stack = undefined;
+    mocks.runStdio.mockRejectedValueOnce(stackless);
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(error).toHaveBeenCalledWith('stackless boot failure'), { timeout: 1000 });
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+      reset();
+    }
+  });
+
+  it('logs unhandled rejections instead of crashing the process', async () => {
+    forceEntryArgv();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      vi.resetModules();
+      await import('./index.js');
+      await vi.waitFor(() => expect(mocks.runStdio).toHaveBeenCalledTimes(1), { timeout: 1000 });
+      expect(onSpy).toHaveBeenCalledWith('unhandledRejection', expect.any(Function));
+      // Invoke the captured handler directly (the onSpy mock swallows real
+      // registration to protect the test-runner process).
+      unhandledRejectionHandler!(new Error('async boom'), Promise.resolve());
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('async boom'));
+      // Non-Error reasons go through the stringifier arm.
+      unhandledRejectionHandler!('plain string rejection', Promise.resolve());
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('plain string rejection'));
+    } finally {
+      error.mockRestore();
+      reset();
+    }
+  });
+
+  it('logUnhandledRejection stringifies Errors (stack) and non-Errors alike', async () => {
+    const { logUnhandledRejection } = await import('./index.js');
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const boom = new Error('boom');
+      logUnhandledRejection(boom);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('boom'));
+      // Stack-less Error: the message fallback arm.
+      const bare = new Error('no stack here');
+      bare.stack = undefined;
+      logUnhandledRejection(bare);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('no stack here'));
+      logUnhandledRejection('just a string');
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('just a string'));
+    } finally {
+      error.mockRestore();
     }
   });
 });

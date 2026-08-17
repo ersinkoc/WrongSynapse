@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 import { openDatabase, type SynapseDatabase } from '../db/connection.js';
 import { migrate } from '../db/schema.js';
@@ -487,6 +487,22 @@ describe('synapse_remember', () => {
       tool('synapse_remember').handler(ctx, { text: 'x', target_scope: 'not-a-valid-scope' }),
     ).rejects.toThrow(/scope/i);
   });
+
+  it('skips auto-dedup when embedding failed (no vector to compare)', async () => {
+    const out = await tool('synapse_remember').handler(failCtx(), {
+      text: 'embedding failed so dedup must not run',
+      target_scope: 'proj:demo/file:nodedup.md',
+      memory_kind: 'general',
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as {
+      embedded: boolean;
+      embed_error: string | null;
+      merged_into: string | null;
+    };
+    expect(parsed.embedded).toBe(false);
+    expect(parsed.embed_error).toBeTruthy();
+    expect(parsed.merged_into).toBeNull(); // dedup requires a fresh embedding
+  });
 });
 
 describe('synapse_recall', () => {
@@ -527,6 +543,24 @@ describe('synapse_recall', () => {
     await expect(
       tool('synapse_recall').handler(ctx, { scopes: 'proj:demo' as unknown as string[] }),
     ).rejects.toThrow(/array/i);
+  });
+
+  it('filters by tags (memory must contain ALL requested tags)', async () => {
+    const tagged = await tool('synapse_remember').handler(ctx, {
+      text: 'rotate database credentials every quarter',
+      target_scope: 'proj:demo/file:creds.md',
+      tags: ['security', 'database'],
+    });
+    const taggedId = JSON.parse(tagged.content[0]!.text).entity_id as string;
+
+    const both = await tool('synapse_recall').handler(ctx, { tags: ['security', 'database'], limit: 50 });
+    const bothParsed = JSON.parse(both.content[0]!.text) as { memories: { id: string; tags: string[] }[] };
+    expect(bothParsed.memories.some((m) => m.id === taggedId)).toBe(true);
+    expect(bothParsed.memories.every((m) => m.tags.includes('security') && m.tags.includes('database'))).toBe(true);
+
+    const none = await tool('synapse_recall').handler(ctx, { tags: ['does-not-exist-anywhere'], limit: 50 });
+    const noneParsed = JSON.parse(none.content[0]!.text) as { memories: unknown[] };
+    expect(noneParsed.memories).toEqual([]);
   });
 });
 
@@ -651,6 +685,47 @@ describe('synapse_link_memories', () => {
       tool('synapse_link_memories').handler(ctx, { source_id: id, target_id: id }),
     ).rejects.toThrow(/must differ/);
   });
+
+  it('rejects unknown ids and non-memory entities', async () => {
+    await expect(
+      tool('synapse_link_memories').handler(ctx, { source_id: 'missing-a', target_id: 'missing-b' }),
+    ).rejects.toThrow(/'missing-a' not found/);
+    const mem = await tool('synapse_remember').handler(ctx, {
+      text: 'type guard probe memory',
+      target_scope: 'proj:demo/file:typeguard.ts',
+      memory_kind: 'general',
+    });
+    const memId = JSON.parse(mem.content[0]!.text).entity_id as string;
+    // A file entity (not a memory_entry) on the target side.
+    await expect(
+      tool('synapse_link_memories').handler(ctx, { source_id: memId, target_id: 'auth-file' }),
+    ).rejects.toThrow(/is not a memory_entry/);
+    // A missing TARGET id (the source resolves, the target does not).
+    await expect(
+      tool('synapse_link_memories').handler(ctx, { source_id: memId, target_id: 'missing-target' }),
+    ).rejects.toThrow(/'missing-target' not found/);
+    // A non-memory SOURCE (file entity first, memory second).
+    await expect(
+      tool('synapse_link_memories').handler(ctx, { source_id: 'auth-file', target_id: memId }),
+    ).rejects.toThrow(/'auth-file' is not a memory_entry/);
+  });
+
+  it('falls back to general for an unknown memory_kind and honours relation_type', async () => {
+    const out = await tool('synapse_remember').handler(ctx, {
+      text: 'zebra xylophone waltz quicksand',
+      // auth.ts carries a structural file entity, so the custom relation has
+      // a real target to anchor against.
+      target_scope: 'proj:demo/file:auth.ts',
+      memory_kind: 'bogus-kind' as never,
+      relation_type: 'RELATES_TO',
+      metadata: { origin: 'test' },
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { entity_id: string; memory_kind: string };
+    expect(parsed.memory_kind).toBe('general'); // unknown kinds degrade, not throw
+    // The custom relation edge exists from the memory to the scoped target.
+    const neighbors = getNeighbors(ctx.db, parsed.entity_id, { relationFilter: ['RELATES_TO'] });
+    expect(neighbors.length).toBeGreaterThan(0);
+  });
 });
 
 describe('synapse_purge_expired', () => {
@@ -698,6 +773,70 @@ describe('synapse_purge_expired', () => {
     // The expired memory is gone; the permanent one is still there.
     expect(getEntity(db, expiredId)).toBeUndefined();
     expect(getEntity(db, permanentId)).toBeDefined();
+  });
+});
+
+describe('argument validation hardening', () => {
+  it('synapse_memory_search applies the memory_kinds post-filter', async () => {
+    await tool('synapse_remember').handler(ctx, {
+      text: 'run migrations before every deploy',
+      target_scope: 'proj:demo/file:deploy.ts',
+      memory_kind: 'workflow',
+    });
+    await tool('synapse_remember').handler(ctx, {
+      text: 'never commit secrets into source files',
+      target_scope: 'proj:demo/file:secrets.ts',
+      memory_kind: 'warning',
+    });
+    const out = await tool('synapse_memory_search').handler(ctx, {
+      query: 'deploy secrets',
+      memory_kinds: ['workflow'],
+      limit: 10,
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { results: { memory_kind: string }[] };
+    expect(parsed.results.length).toBeGreaterThan(0);
+    expect(parsed.results.every((r) => r.memory_kind === 'workflow')).toBe(true);
+  });
+
+  it('rejects malformed scope prefixes upfront with a clean parameter error', async () => {
+    await expect(
+      tool('synapse_hybrid_query').handler(ctx, { query: 'x', scopes: ['not a scope'] }),
+    ).rejects.toThrow();
+    await expect(
+      tool('synapse_recall').handler(ctx, { scopes: ['::bad::'] }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects non-numeric numeric arguments (numberArg throw arm)', async () => {
+    await expect(
+      tool('synapse_hybrid_query').handler(ctx, { query: 'x', limit: 'abc' as unknown as number }),
+    ).rejects.toThrow(/finite number/);
+  });
+
+  it('memory_search passes an explicit types filter through to hybrid search', async () => {
+    const out = await tool('synapse_memory_search').handler(ctx, {
+      query: 'quick',
+      types: ['memory_entry'],
+      limit: 5,
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as { results: { type: string }[] };
+    expect(parsed.results.every((r) => r.type === 'memory_entry')).toBe(true);
+  });
+
+  it('clamps index depth into [1, 64] instead of passing it through raw', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'synapse-depth-clamp-'));
+    try {
+      // depth 0 would walk nothing; the clamp bumps it to the default 20 so
+      // the workspace still indexes.
+      const out = await tool('synapse_index_workspace').handler(ctx, {
+        workspace_path: dir,
+        options: { depth: 0 },
+      });
+      const parsed = JSON.parse(out.content[0]!.text) as { projectScope: string };
+      expect(parsed.projectScope).toBe(`proj:${basename(dir)}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 });

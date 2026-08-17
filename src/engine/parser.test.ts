@@ -101,3 +101,55 @@ describe('indexWorkspace', () => {
     expect(entities.some((e) => e.name === 'tempFn')).toBe(false);
   });
 });
+
+describe('event-loop yielding on large workspaces', () => {
+  it('yields periodically so concurrent requests are not starved', async () => {
+    // 55 files crosses the per-50-files yield boundary; a timer scheduled
+    // alongside the index run must get a chance to fire before the run ends.
+    const big = mkdtempSync(join(tmpdir(), 'synapse-index-big-'));
+    try {
+      writeFileSync(join(big, 'package.json'), JSON.stringify({ name: 'big-fixture' }));
+      for (let i = 0; i < 55; i++) {
+        writeFileSync(join(big, `file${i}.md`), `# doc ${i}\ncontent ${i}\n`);
+      }
+      let ticked = false;
+      // Probe with setImmediate (same phase as the walker's yields): a
+      // setTimeout(0) probe can lose the race — the timer phase needs ≥1ms
+      // of elapsed time, and 56 small files can process in under that.
+      setImmediate(() => {
+        ticked = true;
+      });
+      const result = await indexWorkspace(db, embedder, { workspacePath: big });
+      expect(result.filesScanned).toBe(56);
+      expect(ticked).toBe(true);
+    } finally {
+      rmSync(big, { recursive: true, force: true });
+    }
+  });
+
+  it('parses .tsx files with the TSX grammar (React components survive)', async () => {
+    const tsx = mkdtempSync(join(tmpdir(), 'synapse-index-tsx-'));
+    try {
+      writeFileSync(join(tsx, 'package.json'), JSON.stringify({ name: 'tsx-fixture' }));
+      writeFileSync(
+        join(tsx, 'component.tsx'),
+        [
+          'export function Welcome({ name }: { name: string }) {',
+          '  return <h1>Hello, {name}</h1>;',
+          '}',
+          'export function helper() { return 1; }',
+        ].join('\n'),
+      );
+      const result = await indexWorkspace(db, embedder, { workspacePath: tsx });
+      const symbols = findEntitiesByScope(db, { scopePrefixes: ['proj:tsx-fixture'], types: ['symbol'] });
+      const names = symbols.map((s) => s.name);
+      // With the plain TypeScript grammar, the JSX return produced ERROR
+      // nodes and garbled symbol extraction; the tsx grammar keeps both.
+      expect(names).toContain('Welcome');
+      expect(names).toContain('helper');
+      expect(result.warnings.length).toBe(0);
+    } finally {
+      rmSync(tsx, { recursive: true, force: true });
+    }
+  });
+});

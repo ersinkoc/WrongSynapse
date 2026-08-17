@@ -36,3 +36,42 @@ jobs:
 
       - name: Audit (fail on high/critical)
         run: npm audit --audit-level=high
+
+      # The SPA is shipped in the npm tarball (files: web/dist) but is built
+      # from a separate manifest — without these steps its breakage only
+      # surfaced inside prepublishOnly at publish time.
+      - name: Install web SPA dependencies
+        run: npm run web:install
+
+      - name: Typecheck web SPA
+        run: npm run web:typecheck
+
+      - name: Build web SPA
+        run: npm --prefix web run build
+
+  # The project ships native modules (better-sqlite3, tree-sitter) and has a
+  # history of Windows-only production bugs (--web-open, release shims);
+  # Linux-only CI never caught them.
+  verify-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

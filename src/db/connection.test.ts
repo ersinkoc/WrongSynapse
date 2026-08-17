@@ -84,3 +84,27 @@ describe('describeError', () => {
     expect(describeError(null)).toBe('null');
   });
 });
+
+describe('prepared-statement cache', () => {
+  it('memoizes per SQL string and resets wholesale on overflow', async () => {
+    const db = await openDatabase(':memory:');
+    try {
+      db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+      // Same SQL twice → the same wrapper object (memoized compile).
+      const first = db.prepare('SELECT v FROM t WHERE id = ?');
+      const second = db.prepare('SELECT v FROM t WHERE id = ?');
+      expect(second).toBe(first);
+
+      // 512+ DISTINCT statements force the bounded cache to reset; the
+      // previously cached SQL must still compile and run afterwards.
+      for (let i = 0; i < 600; i++) {
+        db.prepare(`SELECT ${i} AS n FROM t WHERE id = ?`).get(1);
+      }
+      const third = db.prepare('SELECT v FROM t WHERE id = ?');
+      expect(third).not.toBe(first); // the old entry was dropped with the reset
+      expect(third.get(1)).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+});

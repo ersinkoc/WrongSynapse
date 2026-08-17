@@ -52,6 +52,40 @@ describe('entity mapper defensive arms', () => {
     const entity = getEntity(fakeDb({ id: 'x', type: 'file', scope_path: 'proj:p', name: 'n', metadata: undefined }), 'x');
     expect(entity?.metadata).toBeNull();
   });
+
+  it('parseTags: malformed JSON and non-string entries degrade to empty/filtered arrays', () => {
+    const malformed = getEntity(
+      fakeDb({ id: 'x', type: 'memory_entry', scope_path: 'proj:p', name: 'n', tags: 'not json' }),
+      'x',
+    );
+    expect(malformed?.tags).toEqual([]);
+    // Valid JSON that is not an array (e.g. the literal `null`).
+    const jsonNull = getEntity(
+      fakeDb({ id: 'w', type: 'memory_entry', scope_path: 'proj:p', name: 'n', tags: 'null' }),
+      'w',
+    );
+    expect(jsonNull?.tags).toEqual([]);
+    const mixed = getEntity(
+      fakeDb({ id: 'y', type: 'memory_entry', scope_path: 'proj:p', name: 'n', tags: '["ok", 7, null]' }),
+      'y',
+    );
+    expect(mixed?.tags).toEqual(['ok']);
+    const numeric = getEntity(
+      fakeDb({ id: 'z', type: 'memory_entry', scope_path: 'proj:p', name: 'n', tags: 42 }),
+      'z',
+    );
+    expect(numeric?.tags).toEqual([]);
+  });
+
+  it('parseTags: a driver that returns a real array filters non-string members', () => {
+    // node:sqlite can surface JSON columns differently; the Array.isArray
+    // arm accepts a materialised array and keeps only strings.
+    const entity = getEntity(
+      fakeDb({ id: 'a', type: 'memory_entry', scope_path: 'proj:p', name: 'n', tags: ['x', 'y', 3] }),
+      'a',
+    );
+    expect(entity?.tags).toEqual(['x', 'y']);
+  });
 });
 
 describe('getEntityByScope type filter arms', () => {

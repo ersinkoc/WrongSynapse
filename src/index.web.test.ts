@@ -64,7 +64,7 @@ const mocks = vi.hoisted(() => {
   return { runStdio, runSse, openDatabase, migrate, assertFts5, dbStats, getSharedEmbedder, indexWorkspace };
 });
 
-vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase }));
+vi.mock('./db/connection.js', () => ({ openDatabase: mocks.openDatabase, buildVecIndex: vi.fn(() => true) }));
 vi.mock('./db/schema.js', () => ({ migrate: mocks.migrate, assertFts5: mocks.assertFts5 }));
 vi.mock('./db/queries.js', () => ({ dbStats: mocks.dbStats }));
 vi.mock('./engine/embedding.js', () => ({ getSharedEmbedder: mocks.getSharedEmbedder }));
@@ -357,7 +357,7 @@ describe('CLI main() with the web server enabled', () => {
       // Both banners appear: the web boot + the SSE listen.
       const stderr = stderrOf(errSpy);
       expect(stderr).toMatch(/admin web UI listening on http:\/\/127\.0\.0\.1:\d+/);
-      expect(stderr).toMatch(/SSE server listening on http:\/\/localhost:9124\/sse/);
+      expect(stderr).toMatch(/SSE server listening on http:\/\/127\.0\.0\.1:9124\/sse/);
     } finally {
       errSpy.mockRestore();
     }
@@ -372,7 +372,7 @@ describe('CLI main() with the web server enabled', () => {
       await main(['--transport', 'sse', '--port', '9125', '--no-web']);
       const stderr = stderrOf(errSpy);
       expect(stderr).not.toContain('admin web UI');
-      expect(stderr).toMatch(/SSE server listening on http:\/\/localhost:9125\/sse/);
+      expect(stderr).toMatch(/SSE server listening on http:\/\/127\.0\.0\.1:9125\/sse/);
     } finally {
       errSpy.mockRestore();
     }
