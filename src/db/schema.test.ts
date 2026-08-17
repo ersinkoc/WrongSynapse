@@ -1,7 +1,9 @@
+import { createRequire } from 'node:module';
+
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { openDatabase, type SynapseDatabase } from './connection.js';
-import { assertFts5, migrate } from './schema.js';
+import { assertFts5, migrate, SCHEMA_VERSION } from './schema.js';
 import {
   deleteEntity,
   getEntity,
@@ -12,6 +14,12 @@ import {
   searchFts,
   upsertVector,
 } from './queries.js';
+
+// ESM-friendly bridge for the CommonJS `better-sqlite3` native binding used in
+// the partial-migration fixture test. `createRequire` keeps the binding through
+// Vitest's module-resolution pipeline (a bare `require()` inside an ESM file
+// triggers Vitest's `require-not-allowed` lint rule).
+const requireNative = createRequire(import.meta.url);
 
 let db: SynapseDatabase;
 
@@ -38,11 +46,68 @@ describe('assertFts5 failure branch', () => {
 
 
 describe('migrations', () => {
-  it('advances user_version and creates the FTS table', () => {
+  it('advances user_version to SCHEMA_VERSION and creates the FTS table', () => {
     const row = db.prepare('PRAGMA user_version').get();
-    expect(row?.['user_version']).toBe(1);
+    expect(row?.['user_version']).toBe(SCHEMA_VERSION);
     const fts = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'entities_fts'").get();
     expect(fts).toBeDefined();
+  });
+
+  it('is idempotent — calling migrate again does not error on partial state', () => {
+    // Simulate a PARTIAL v2 migration: `memory_kind` was added on a previous
+    // boot but the rest of the v2 columns never landed (e.g. process crashed
+    // mid-migration, or an older SQLite build hit the `ADD COLUMN IF NOT
+    // EXISTS` syntax error). The next migrate() must add the missing columns
+    // without touching the ones already present.
+    const fresh = requireNative('better-sqlite3')(':memory:');
+    fresh.pragma('journal_mode = WAL');
+    fresh.pragma('foreign_keys = ON');
+    fresh.exec(`
+      CREATE TABLE entities (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        scope_path TEXT NOT NULL,
+        name TEXT NOT NULL,
+        content TEXT,
+        metadata JSON,
+        confidence REAL DEFAULT 1.0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        memory_kind TEXT DEFAULT 'general'
+      );
+    `);
+    expect(() => {
+      // Wrap the raw better-sqlite3 instance into a SynapseDatabase-compatible
+      // shim and call migrate on it. The v2 migration should inspect
+      // table_info(entities) and add only the missing columns.
+      const shim = {
+        exec: (sql: string) => fresh.exec(sql),
+        prepare: (sql: string) => {
+          const s = fresh.prepare(sql);
+          return {
+            run: (...p: unknown[]) => s.run(...(p as never[])),
+            get: (...p: unknown[]) => s.get(...(p as never[])),
+            all: (...p: unknown[]) => s.all(...(p as never[])),
+          };
+        },
+        transaction: <T>(fn: () => T): T => fresh.transaction(fn)(),
+        close: () => fresh.close(),
+      } as unknown as SynapseDatabase;
+      migrate(shim);
+    }).not.toThrow();
+    // Verify the partial state was repaired:
+    //  - memory_kind (already present) was preserved
+    //  - importance, expires_at, last_accessed_at, tags were added
+    const cols = fresh
+      .prepare('PRAGMA table_info(entities)')
+      .all()
+      .map((r: { name: string }) => r.name);
+    expect(cols).toContain('memory_kind');
+    expect(cols).toContain('importance');
+    expect(cols).toContain('expires_at');
+    expect(cols).toContain('last_accessed_at');
+    expect(cols).toContain('tags');
+    fresh.close();
   });
 });
 

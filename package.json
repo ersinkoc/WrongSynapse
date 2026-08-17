@@ -70,6 +70,7 @@
     "better-sqlite3": "^13.0.3",
     "ignore": "^7.0.6",
     "simple-git": "^3.36.0",
+    "sqlite-vec": "^0.1.9",
     "tree-sitter-go": "^0.25.0",
     "tree-sitter-javascript": "^0.25.0",
     "tree-sitter-python": "^0.25.0",

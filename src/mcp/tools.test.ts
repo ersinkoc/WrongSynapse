@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,7 +33,7 @@ afterAll(() => {
 });
 
 describe('MCP tool definitions', () => {
-  it('exposes all eight tools', () => {
+  it('exposes all thirteen tools', () => {
     expect(TOOL_DEFINITIONS.map((t) => t.name)).toEqual([
       'synapse_index_workspace',
       'synapse_hybrid_query',
@@ -43,6 +43,11 @@ describe('MCP tool definitions', () => {
       'synapse_promote_candidate',
       'synapse_list_candidates',
       'synapse_discard_candidate',
+      'synapse_remember',
+      'synapse_recall',
+      'synapse_memory_search',
+      'synapse_link_memories',
+      'synapse_purge_expired',
     ]);
   });
 });
@@ -442,4 +447,257 @@ describe('embedding-unavailable degradation (anchored memories)', () => {
     expect(parsed.embedded).toBe(false);
     expect(parsed.embed_error).toBe('embedding service exploded');
   });
+
+describe('synapse_remember', () => {
+  it('stores a durable memory and surfaces it via recall', async () => {
+    const out = await tool('synapse_remember').handler(ctx, {
+      text: 'JWTs must be rotated every 30 days for compliance',
+      target_scope: 'proj:demo/file:auth.ts',
+      memory_kind: 'convention',
+      importance: 0.8,
+      tags: ['auth', 'security'],
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as {
+      entity_id: string;
+      embedded: boolean;
+      memory_kind: string;
+      tags: string[];
+      anchored_to_entity_id: string | null;
+    };
+    expect(parsed.embedded).toBe(true);
+    expect(parsed.memory_kind).toBe('convention');
+    expect(parsed.tags).toEqual(['auth', 'security']);
+    expect(parsed.anchored_to_entity_id).toBeTruthy();
+    expect(parsed.entity_id).toBeTruthy();
+
+    // Round-trip via recall (the canonical retrieval path for stored memories).
+    const recall = await tool('synapse_recall').handler(ctx, {
+      scopes: ['proj:demo/file:auth.ts'],
+      memory_kinds: ['convention'],
+      limit: 5,
+    });
+    const recallParsed = JSON.parse(recall.content[0]!.text) as {
+      memories: { id: string; memory_kind: string }[];
+    };
+    expect(recallParsed.memories.some((r) => r.id === parsed.entity_id)).toBe(true);
+  });
+
+  it('rejects malformed scope', async () => {
+    await expect(
+      tool('synapse_remember').handler(ctx, { text: 'x', target_scope: 'not-a-valid-scope' }),
+    ).rejects.toThrow(/scope/i);
+  });
+});
+
+describe('synapse_recall', () => {
+  it('filters by memory_kind and updates last_accessed_at', async () => {
+    // Seed two memories of different kinds under the same scope.
+    const fact = await tool('synapse_remember').handler(ctx, {
+      text: 'the staging DB password is rotated weekly',
+      target_scope: 'proj:demo/file:ops.md',
+      memory_kind: 'fact',
+    });
+    const warning = await tool('synapse_remember').handler(ctx, {
+      text: 'never log secrets even in dev mode',
+      target_scope: 'proj:demo/file:ops.md',
+      memory_kind: 'warning',
+    });
+    const factId = JSON.parse(fact.content[0]!.text).entity_id as string;
+    void JSON.parse(warning.content[0]!.text).entity_id;
+
+    // Recall with kind filter — the 'fact' must come back, the 'warning' must not.
+    const out = await tool('synapse_recall').handler(ctx, {
+      scopes: ['proj:demo/file:ops.md'],
+      memory_kinds: ['fact'],
+      limit: 10,
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as {
+      memories: { id: string; memory_kind: string }[];
+    };
+    expect(parsed.memories.every((r) => r.memory_kind === 'fact')).toBe(true);
+    expect(parsed.memories.some((r) => r.id === factId)).toBe(true);
+
+    // The recalled memory must have its last_accessed_at bumped.
+    const touched = getEntity(db, factId);
+    expect(touched?.lastAccessedAt).toBeTypeOf('number');
+    expect(touched!.lastAccessedAt!).toBeGreaterThan(0);
+  });
+
+  it('rejects a non-array scopes argument', async () => {
+    await expect(
+      tool('synapse_recall').handler(ctx, { scopes: 'proj:demo' as unknown as string[] }),
+    ).rejects.toThrow(/array/i);
+  });
+});
+
+describe('synapse_memory_search', () => {
+  it('runs tri-hybrid search and returns per-channel ranks', async () => {
+    // Seed two memories; one with matching text, one unrelated.
+    await tool('synapse_remember').handler(ctx, {
+      text: 'rate limiter token bucket burst size must be 20',
+      target_scope: 'proj:demo/file:rate-limit.ts',
+      memory_kind: 'convention',
+    });
+    await tool('synapse_remember').handler(ctx, {
+      text: 'never trust client-supplied tokens',
+      target_scope: 'proj:demo/file:auth.ts',
+      memory_kind: 'warning',
+    });
+
+    const out = await tool('synapse_memory_search').handler(ctx, {
+      query: 'rate limiter token bucket',
+      limit: 5,
+    });
+    const parsed = JSON.parse(out.content[0]!.text) as {
+      count: number;
+      results: { scope_path: string; content: string | null; ranks: { fts: number | null; vector: number | null; graph: number | null } }[];
+      vector_retrieval_used: boolean;
+    };
+    expect(parsed.count).toBeGreaterThan(0);
+    // The top result must be the rate-limit memory (matching text). The
+    // `name` field is the content (truncated to 80 chars in insertEntity),
+    // so asserting on `scope_path` + `content` is the correct shape.
+    const top = parsed.results[0]!;
+    expect(top.scope_path).toBe('proj:demo/file:rate-limit.ts');
+    expect(top.content).toContain('rate limiter token bucket');
+    // All three channels must contribute ranks (lexical + semantic + graph).
+    expect(top.ranks.fts).not.toBeNull();
+    expect(top.ranks.vector).not.toBeNull();
+    expect(parsed.vector_retrieval_used).toBe(true);
+  });
+});
+
+describe('synapse_link_memories', () => {
+  it('creates a SUPERSEDES edge from the new memory to the old', async () => {
+    // Seed two memories with the same scope but lexically distinct text so
+    // dedup (cosine >= 0.85 against the FakeEmbedder's deterministic output)
+    // will not merge them. The two strings below share no tokens.
+    const oldOut = await tool('synapse_remember').handler(ctx, {
+      text: 'banana bicycle quantum zebra',
+      target_scope: 'proj:demo/file:auth.ts',
+      memory_kind: 'convention',
+    });
+    const newOut = await tool('synapse_remember').handler(ctx, {
+      text: 'apple dragon kite marigold',
+      target_scope: 'proj:demo/file:auth.ts',
+      memory_kind: 'convention',
+    });
+    const oldId = JSON.parse(oldOut.content[0]!.text).entity_id as string;
+    const newId = JSON.parse(newOut.content[0]!.text).entity_id as string;
+    // Sanity: the two remember calls must produce distinct entities. If dedup
+    // ever loosens, the link assertion below would silently pass against the
+    // same id and the test would throw at source_id === target_id.
+    expect(oldId).not.toBe(newId);
+
+    // source_id = old (being archived), target_id = new (replacement).
+    const link = await tool('synapse_link_memories').handler(ctx, {
+      source_id: oldId,
+      target_id: newId,
+    });
+    const parsed = JSON.parse(link.content[0]!.text) as { relation: string; bidirectional: boolean };
+    expect(parsed.relation).toBe('SUPERSEDES');
+    expect(parsed.bidirectional).toBe(false);
+
+    // The edge must flow new → old (so retrieval chains can walk from the
+    // current memory back to its archived ancestors).
+    const edges = getNeighbors(db, newId, { depth: 1, direction: 'out', relationFilter: ['SUPERSEDES'] });
+    expect(edges.some((e) => e.entityId === oldId)).toBe(true);
+
+    // Without bidirectional=true, the SUPERSEDED_BY inverse must NOT exist.
+    const inverseFromOld = getNeighbors(db, oldId, { depth: 1, direction: 'out', relationFilter: ['SUPERSEDED_BY'] });
+    expect(inverseFromOld.some((e) => e.entityId === newId)).toBe(false);
+  });
+
+  it('bidirectional=true inserts both SUPERSEDES and SUPERSEDED_BY', async () => {
+    // Distinct scopes — the cheapest, most reliable way to guarantee the two
+    // seeds won't dedup-merge. Lexically distinct strings also bypass dedup,
+    // but scopes don't depend on the FakeEmbedder's cosine output.
+    const oldOut = await tool('synapse_remember').handler(ctx, {
+      text: 'coconut elephant fountain giraffe',
+      target_scope: 'proj:demo/file:tokens-v1.md',
+      memory_kind: 'convention',
+    });
+    const newOut = await tool('synapse_remember').handler(ctx, {
+      text: 'daisy fox glacier harp',
+      target_scope: 'proj:demo/file:tokens-v2.md',
+      memory_kind: 'convention',
+    });
+    const oldId = JSON.parse(oldOut.content[0]!.text).entity_id as string;
+    const newId = JSON.parse(newOut.content[0]!.text).entity_id as string;
+    expect(oldId).not.toBe(newId);
+
+    const link = await tool('synapse_link_memories').handler(ctx, {
+      source_id: oldId,
+      target_id: newId,
+      bidirectional: true,
+    });
+    const parsed = JSON.parse(link.content[0]!.text) as { bidirectional: boolean };
+    expect(parsed.bidirectional).toBe(true);
+
+    const supersededEdges = getNeighbors(db, newId, { depth: 1, direction: 'out', relationFilter: ['SUPERSEDES'] });
+    expect(supersededEdges.some((e) => e.entityId === oldId)).toBe(true);
+    const supersededByEdges = getNeighbors(db, oldId, { depth: 1, direction: 'out', relationFilter: ['SUPERSEDED_BY'] });
+    expect(supersededByEdges.some((e) => e.entityId === newId)).toBe(true);
+  });
+
+  it('rejects linking a memory to itself', async () => {
+    const out = await tool('synapse_remember').handler(ctx, {
+      text: 'circular test entry',
+      target_scope: 'proj:demo/file:loop.ts',
+      memory_kind: 'general',
+    });
+    const id = JSON.parse(out.content[0]!.text).entity_id as string;
+    await expect(
+      tool('synapse_link_memories').handler(ctx, { source_id: id, target_id: id }),
+    ).rejects.toThrow(/must differ/);
+  });
+});
+
+describe('synapse_purge_expired', () => {
+  beforeEach(() => {
+    // Drive all time arithmetic in this suite with Vitest's fake clock so the
+    // test is deterministic and CI-fast (no real setTimeout, no race on the
+    // host's wall clock). The fake clock applies to Date.now(), setTimeout,
+    // and setInterval by default.
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('removes memory entries whose TTL has elapsed and leaves fresh ones intact', async () => {
+    // Pin the clock so `expires_at` arithmetic is deterministic. The seed
+    // step calls Date.now() internally; advancing first prevents the seed
+    // timestamp from sitting exactly on a boundary.
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+
+    // Distinct scopes — the cheapest, most reliable way to guarantee the two
+    // seeds won't dedup-merge into a single entity (which would swap
+    // expiredId/permanentId and silently break the purge assertions).
+    const expiredOut = await tool('synapse_remember').handler(ctx, {
+      text: 'this convention was valid until 2024',
+      target_scope: 'proj:demo/file:legacy-expired.md',
+      memory_kind: 'convention',
+      ttl_seconds: 60,
+    });
+    const permanentOut = await tool('synapse_remember').handler(ctx, {
+      text: 'use HTTPS for all internal traffic',
+      target_scope: 'proj:demo/file:legacy-permanent.md',
+      memory_kind: 'convention',
+    });
+    const expiredId = JSON.parse(expiredOut.content[0]!.text).entity_id as string;
+    const permanentId = JSON.parse(permanentOut.content[0]!.text).entity_id as string;
+
+    // Advance the fake clock past the 60-second TTL window plus a buffer.
+    vi.setSystemTime(new Date('2026-01-01T00:02:00Z'));
+
+    const purge = await tool('synapse_purge_expired').handler(ctx, {});
+    const parsed = JSON.parse(purge.content[0]!.text) as { deleted: number; message: string };
+    expect(parsed.deleted).toBeGreaterThanOrEqual(1);
+
+    // The expired memory is gone; the permanent one is still there.
+    expect(getEntity(db, expiredId)).toBeUndefined();
+    expect(getEntity(db, permanentId)).toBeDefined();
+  });
+});
 });

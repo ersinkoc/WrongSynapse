@@ -174,7 +174,7 @@ describe('runSse (end-to-end over HTTP)', () => {
       const toolsResp = await toolsWait;
       const tools = ((toolsResp['result'] as { tools?: { name: string }[] }).tools ?? []).map((t) => t.name);
       expect(tools).toEqual(TOOL_DEFINITIONS.map((t) => t.name));
-      expect(tools).toHaveLength(8);
+      expect(tools).toHaveLength(TOOL_DEFINITIONS.length);
     } finally {
       await handle.close();
     }

@@ -10,7 +10,7 @@
  * graph results and reports a warning.
  */
 
-import type { SynapseDatabase } from '../db/connection.js';
+import type { SynapseDatabase, VecCapabilities } from '../db/connection.js';
 import {
   getEntity,
   getGraphPath,
@@ -23,6 +23,9 @@ import {
 import { scopeMatchesAnyPrefix } from '../utils/scope.js';
 import { cosineSimilarity } from './vector-math.js';
 import type { Embedder } from './embedding.js';
+
+// Augment SynapseDatabase with sqlite-vec capabilities when the extension is loaded.
+type SynapseDbWithVec = SynapseDatabase & { vec: VecCapabilities };
 
 export interface HybridQueryOptions {
   query: string;
@@ -60,6 +63,16 @@ const MAX_CANDIDATES = 100;
  * arbitrary slice.
  */
 const VECTOR_SCAN_CAP = 10_000;
+
+/**
+ * A memory entry is expired when its `expires_at` is non-null and in the past.
+ * The hybrid search filters expired entries at candidate-retrieval time
+ * (before RRF truncation) so a TTL-expiring corpus can't silently evict the
+ * recall channel's only relevant hits.
+ */
+function isExpired(entity: { expiresAt: number | null }, now: number): boolean {
+  return entity.expiresAt !== null && entity.expiresAt <= now;
+}
 const SEED_LIMIT = 5;
 const NEIGHBOR_CAP = 50;
 
@@ -93,6 +106,7 @@ export async function hybridSearch(
 
   // ---- 1. Lexical (FTS5 / BM25) -------------------------------------------
   const ftsRanked: string[] = [];
+  const expiryNow = Date.now();
   for (const hit of searchFts(db, query, MAX_CANDIDATES)) {
     // FK cascades delete FTS rows with their entities, so a missing entity
     // here is not producible through the public API.
@@ -100,36 +114,99 @@ export async function hybridSearch(
     /* v8 ignore next */
     if (entity === undefined) continue;
     if (!matchesFilters(entity.scopePath, entity.type, scopes, typesFilter)) continue;
+    // Expire expired memory entries at the candidate level so RRF truncation
+    // cannot silently evict the recall channel's only relevant hits.
+    if (isExpired(entity, expiryNow)) continue;
     // entities_fts is content-linked to entities (1:1 on rowid), so the JOIN
     // cannot yield the same entity twice.
     /* v8 ignore next */
     if (!ftsRanked.includes(hit.entityId)) ftsRanked.push(hit.entityId);
   }
 
-  // ---- 2. Semantic (cosine over stored vectors) ----------------------------
+  // ---- 2. Semantic (HNSW ANN via sqlite-vec or full-table cosine fallback) ---
   const vecRanked: string[] = [];
   let vectorRetrievalUsed = false;
   if (vectorWeight > 0) {
     try {
       await embedder.init();
       const queryVec = await embedder.embed(query);
-      const candidates = getVectors(db, {
-        scopePrefixes: scopes.length > 0 ? [...scopes] : undefined,
-        types: typesFilter,
-        limit: VECTOR_SCAN_CAP,
-      });
-      if (candidates.length >= VECTOR_SCAN_CAP) {
-        warnings.push(`semantic scan truncated at ${VECTOR_SCAN_CAP} vectors (deterministic subset by entity id)`);
+      const dbVec = (db as SynapseDbWithVec).vec;
+
+      if (dbVec?.hnswEnabled && dbVec.hnswBuildComplete) {
+        // --- HNSW ANN search via sqlite-vec ---
+        // sqlite-vec requires embedding as a literal JSON array and k as a literal integer.
+        // queryVec values are trusted floats from the embedder (not user input), so building
+        // the JSON inline is safe here. k is a positive integer constant.
+        const embedJson = JSON.stringify([...queryVec]);
+        // Fetch a large batch to reduce the "global ANN neighbors are out-of-scope" gap.
+        // sqlite-vec does not support OFFSET; the cosine fallback covers remaining cases.
+        const topK = MAX_CANDIDATES * 20;
+        const rows = db.prepare(
+          `SELECT entity_id, distance
+           FROM vec_entities
+           WHERE embedding match '${embedJson}'
+           AND k = ${topK}`
+        ).all() as { entity_id: string; distance: number }[];
+        const seen = new Set<string>();
+        for (const row of rows) {
+          const entity = getEntity(db, row.entity_id);
+          if (!entity) continue;
+          if (!matchesFilters(entity.scopePath, entity.type, scopes, typesFilter)) continue;
+          if (isExpired(entity, expiryNow)) continue;
+          if (seen.has(row.entity_id)) continue;
+          seen.add(row.entity_id);
+          if (vecRanked.length < MAX_CANDIDATES) vecRanked.push(row.entity_id);
+        }
+        // If the large ANN batch yielded few/none in-filter results, fall back to
+        // exact cosine scan over BLOB vectors. This guards against a sparse HNSW
+        // index (e.g. new DB, few indexed entries) or extreme scope mismatch.
+        if (vecRanked.length < MAX_CANDIDATES) {
+          const candidates = getVectors(db, {
+            scopePrefixes: scopes.length > 0 ? [...scopes] : undefined,
+            types: typesFilter,
+            limit: VECTOR_SCAN_CAP,
+          });
+          const scored: { id: string; score: number }[] = [];
+          for (const candidate of candidates) {
+            if (candidate.embedding.length !== queryVec.length) continue;
+            scored.push({ id: candidate.entityId, score: cosineSimilarity(queryVec, candidate.embedding) });
+          }
+          scored.sort((a, b) => b.score - a.score);
+          for (const entry of scored.slice(0, MAX_CANDIDATES - vecRanked.length)) {
+            if (!seen.has(entry.id)) vecRanked.push(entry.id);
+          }
+          if (vecRanked.length > 0) {
+            warnings.push('ANN batch yielded fewer results than expected; cosine scan filled remaining slots.');
+          }
+        }
+        vectorRetrievalUsed = vecRanked.length > 0;
+      } else {
+        // --- Full-table cosine scan (legacy fallback) ---
+        const candidates = getVectors(db, {
+          scopePrefixes: scopes.length > 0 ? [...scopes] : undefined,
+          types: typesFilter,
+          limit: VECTOR_SCAN_CAP,
+        });
+        if (candidates.length >= VECTOR_SCAN_CAP) {
+          warnings.push(`semantic scan truncated at ${VECTOR_SCAN_CAP} vectors (deterministic subset by entity id)`);
+        }
+        const scored: { id: string; score: number }[] = [];
+        for (const candidate of candidates) {
+          if (!matchesFilters(candidate.scopePath, candidate.type, scopes, typesFilter)) continue;
+          // Expiry check: getVectors' SQL already filters expired vectors out
+          // (WHERE expires_at IS NULL OR expires_at > ? in src/db/queries.ts),
+          // so every candidate here is fresh. The `isExpired` call would be
+          // dead code AND a typecheck error since VectorHit doesn't expose
+          // expiresAt (the column isn't projected). Documented to keep the
+          // invariant visible — do not re-add the call here without also
+          // projecting e.expires_at in the getVectors SQL.
+          if (candidate.embedding.length !== queryVec.length) continue; // dimension mismatch: skip
+          scored.push({ id: candidate.entityId, score: cosineSimilarity(queryVec, candidate.embedding) });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        for (const entry of scored.slice(0, MAX_CANDIDATES)) vecRanked.push(entry.id);
+        vectorRetrievalUsed = true;
       }
-      const scored: { id: string; score: number }[] = [];
-      for (const candidate of candidates) {
-        if (!matchesFilters(candidate.scopePath, candidate.type, scopes, typesFilter)) continue;
-        if (candidate.embedding.length !== queryVec.length) continue; // dimension mismatch: skip
-        scored.push({ id: candidate.entityId, score: cosineSimilarity(queryVec, candidate.embedding) });
-      }
-      scored.sort((a, b) => b.score - a.score);
-      for (const entry of scored.slice(0, MAX_CANDIDATES)) vecRanked.push(entry.id);
-      vectorRetrievalUsed = true;
     } catch (error) {
       warnings.push(`semantic retrieval skipped: ${describeError(error)}`);
     }
@@ -143,6 +220,7 @@ export async function hybridSearch(
     for (const seed of seeds) {
       for (const neighbor of getNeighbors(db, seed, { depth: graphDepth, direction: 'both', maxNodes: NEIGHBOR_CAP })) {
         const entity = getEntity(db, neighbor.entityId);
+        if (entity !== undefined && isExpired(entity, expiryNow)) continue;
         // FK cascades delete relations with their entities, so a missing
         // neighbor is not producible through the public API.
         /* v8 ignore next */

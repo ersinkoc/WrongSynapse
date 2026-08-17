@@ -20,7 +20,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { openDatabase, type SynapseDatabase } from './db/connection.js';
+import { buildHnswIndexes, openDatabase, type SynapseDatabase } from './db/connection.js';
 import { assertFts5, migrate } from './db/schema.js';
 import { dbStats } from './db/queries.js';
 import { getSharedEmbedder } from './engine/embedding.js';
@@ -261,6 +261,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   migrate(db);
   assertFts5(db);
 
+  // sqlite-vec HNSW index: build once from existing BLOB vectors if the
+  // extension loaded. Safe to call on every boot (IF NOT EXISTS guard inside).
+  // `db.vec` is optional — mocked databases in tests don't populate it.
+  if (db.vec?.hnswEnabled && !db.vec.hnswBuildComplete) {
+    buildHnswIndexes(db);
+    db.vec.hnswBuildComplete = true;
+  }
+
   const modelDir = cli['model-dir'] !== undefined && cli['model-dir'] !== '' ? cli['model-dir'] : undefined;
   const allowRemote = cli['allow-remote-model'] === true || process.env['SYNAPSE_ALLOW_REMOTE_MODEL'] === '1';
   const noRemote = cli['no-remote-model'] === true || process.env['SYNAPSE_NO_REMOTE_MODEL'] === '1';
@@ -271,7 +279,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     allowRemoteModels: allowRemote ? true : undefined,
     noRemoteModels: noRemote ? true : undefined,
   });
-  const ctx = { db, embedder };
+  // Wrap the embedder in a semantic cache so identical text never hits the
+  // embedder twice. Trade-off: ~1.5 KB per cached entry (Float32×384) at
+  // default 1024 entries = ~1.5 MB ceiling. Tuning knobs are exposed for
+  // tests; defaults are sensible for a single-writer CLI.
+  const { EmbeddingCache } = await import('./engine/embedding-cache.js');
+  const embeddingCache = new EmbeddingCache({
+    maxEntries: 1024,
+    ttlMs: 60 * 60 * 1000,
+  });
+  const cachedEmbedder = embeddingCache.wrap(embedder);
+  const ctx = { db, embedder: cachedEmbedder, embeddingCache };
 
   // One-shot workspace index mode
   if (cli.index !== undefined && cli.index !== '') {

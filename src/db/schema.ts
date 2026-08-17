@@ -9,6 +9,51 @@
 
 import { describeError, type SynapseDatabase } from './connection.js';
 
+/** Columns added by the v2 memory-fields migration. */
+const MEMORY_FIELD_COLUMNS = [
+  { name: 'memory_kind', def: "TEXT DEFAULT 'general'" },
+  { name: 'importance', def: 'REAL DEFAULT 0.5' },
+  { name: 'expires_at', def: 'INTEGER' },
+  { name: 'last_accessed_at', def: 'INTEGER' },
+  { name: 'tags', def: "TEXT DEFAULT '[]'" },
+] as const;
+
+/**
+ * Build the v2 migration SQL by inspecting `PRAGMA table_info(entities)` and
+ * emitting only `ALTER TABLE` statements for columns that are missing. This
+ * lets the migration be safely re-run after a partial failure (e.g. when a
+ * SQLite build lacks `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, which is
+ * SQLite >= 3.35.0 only).
+ */
+function buildMemoryFieldsMigration(db: SynapseDatabase): string {
+  const existing = (db.prepare('PRAGMA table_info(entities)').all() as { name: string }[])
+    .map((row) => row.name);
+  const statements: string[] = [];
+  for (const col of MEMORY_FIELD_COLUMNS) {
+    if (!existing.includes(col.name)) {
+      statements.push(`ALTER TABLE entities ADD COLUMN ${col.name} ${col.def};`);
+    }
+  }
+  return statements.join('\n');
+}
+
+/**
+ * Build the v2 migration SQL statically (no inspection). Used when the caller
+ * doesn't have a database handle yet (e.g. listing MIGRATIONS for tests).
+ * The dynamic variant above is what actually runs.
+ */
+const MIGRATION_V2_MEMORY_FIELDS_STATIC = MEMORY_FIELD_COLUMNS
+  .map((col) => `ALTER TABLE entities ADD COLUMN ${col.name} ${col.def};`)
+  .join('\n');
+
+const MIGRATION_V3_MEMORY_INDEX = `
+-- Indexes for the new memory fields (run only if not exists)
+CREATE INDEX IF NOT EXISTS idx_entities_memory_kind ON entities(memory_kind);
+CREATE INDEX IF NOT EXISTS idx_entities_importance ON entities(importance);
+CREATE INDEX IF NOT EXISTS idx_entities_expires ON entities(expires_at);
+CREATE INDEX IF NOT EXISTS idx_entities_last_accessed ON entities(last_accessed_at);
+`;
+
 const MIGRATION_V1 = `
 -- 1. UNIFIED ENTITY HIERARCHY
 CREATE TABLE IF NOT EXISTS entities (
@@ -78,15 +123,25 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_memory_candidates_status ON memory_candidates(status);
+
+-- 6. MEMORY ENTRIES: extended schema with kind, importance, TTL, tags
+-- This is a schema extension via ALTER TABLE after migration 1 is applied.
+-- Executed in migrate() after all prior migrations.
 `;
 
-export const MIGRATIONS: readonly string[] = [MIGRATION_V1];
+export const MIGRATIONS: readonly string[] = [MIGRATION_V1, MIGRATION_V2_MEMORY_FIELDS_STATIC, MIGRATION_V3_MEMORY_INDEX];
 
 export const SCHEMA_VERSION: number = MIGRATIONS.length;
 
 /**
  * Bring the database schema up to the current version. Idempotent; safe to
  * call on every boot.
+ *
+ * Special handling: the v2 memory-fields migration is also re-evaluated on
+ * every boot so that any ALTER TABLE statement that failed on an older SQLite
+ * (which lacks `ADD COLUMN IF NOT EXISTS`) gets a second chance. If every
+ * column is already present, `buildMemoryFieldsMigration` returns an empty
+ * string and the loop bumps `user_version` without executing SQL.
  */
 export function migrate(db: SynapseDatabase): void {
   const row = db.prepare('PRAGMA user_version').get();
@@ -94,10 +149,13 @@ export function migrate(db: SynapseDatabase): void {
   // integer row on both drivers.
   /* v8 ignore next */
   let version = typeof row?.['user_version'] === 'number' ? (row['user_version'] as number) : 0;
-  while (version < MIGRATIONS.length) {
-    const sql = MIGRATIONS[version]!;
+  while (version < SCHEMA_VERSION) {
     db.transaction(() => {
-      db.exec(sql);
+      // v2 (index 1) is dynamic — inspect existing columns before emitting SQL.
+      const sql = version === 1 ? buildMemoryFieldsMigration(db) : MIGRATIONS[version]!;
+      if (sql.trim().length > 0) {
+        db.exec(sql);
+      }
       db.exec(`PRAGMA user_version = ${version + 1};`);
     });
     version += 1;

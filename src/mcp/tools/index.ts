@@ -7,10 +7,19 @@ import { z } from 'zod';
 
 import type { SynapseDatabase } from '../../db/connection.js';
 import type { Embedder } from '../../engine/embedding.js';
+import type { EmbeddingCache } from '../../engine/embedding-cache.js';
 
 export interface ToolContext {
   db: SynapseDatabase;
   embedder: Embedder;
+  /**
+   * Optional semantic cache wrapping the embedder. When present, the cache
+   * reduces redundant embedding work on identical text — the embedder is the
+   * dominant cost in the memory pipeline, and deduplication → remember calls
+   * repeatedly hit the same content. Optional because tests construct
+   * ToolContext without it.
+   */
+  embeddingCache?: EmbeddingCache;
 }
 
 export type ToolArgs = Record<string, unknown>;

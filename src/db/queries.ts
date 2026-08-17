@@ -6,7 +6,7 @@
 
 import { randomUUID } from 'node:crypto';
 
-import { bufferToEmbedding, embeddingToBuffer } from '../engine/vector-math.js';
+import { bufferToEmbedding, cosineSimilarity, embeddingToBuffer, l2Norm } from '../engine/vector-math.js';
 
 import type { SqlValue, SynapseDatabase } from './connection.js';
 
@@ -22,6 +22,11 @@ export interface NewEntity {
   content?: string | null;
   metadata?: Record<string, unknown> | null;
   confidence?: number;
+  memoryKind?: string;
+  importance?: number;
+  expiresAt?: number | null;
+  lastAccessedAt?: number | null;
+  tags?: readonly string[];
 }
 
 export interface EntityRow {
@@ -34,6 +39,11 @@ export interface EntityRow {
   confidence: number;
   createdAt: number;
   updatedAt: number;
+  memoryKind: string;
+  importance: number;
+  expiresAt: number | null;
+  lastAccessedAt: number | null;
+  tags: string[];
 }
 
 export interface NewRelation {
@@ -168,7 +178,27 @@ function entityFromRow(row: Record<string, unknown>): EntityRow {
     confidence: num(row, 'confidence'),
     createdAt: num(row, 'created_at'),
     updatedAt: num(row, 'updated_at'),
+    // Memory enrichment fields (may not exist on pre-v2 dbs; fall back to defaults)
+    memoryKind: (row['memory_kind'] as string | null) ?? 'general',
+    importance: optNum(row, 'importance') ?? 0.5,
+    expiresAt: optNum(row, 'expires_at') ?? null,
+    lastAccessedAt: optNum(row, 'last_accessed_at') ?? null,
+    tags: parseTags(row['tags']),
   };
+}
+
+function parseTags(value: unknown): string[] {
+  if (value === null || value === undefined) return [];
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed.filter((v) => typeof v === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+  if (Array.isArray(value)) return value.filter((v) => typeof v === 'string');
+  return [];
 }
 
 function candidateFromRow(row: Record<string, unknown>): CandidateRow {
@@ -192,9 +222,11 @@ const nowMs = (): number => Date.now();
 /** Insert or update an entity by id. Returns whether the row already existed. */
 export function insertEntity(db: SynapseDatabase, entity: NewEntity): boolean {
   const exists = db.prepare('SELECT 1 AS x FROM entities WHERE id = ?').get(entity.id) !== undefined;
+  const now = nowMs();
+  const tags = entity.tags !== undefined ? JSON.stringify([...entity.tags]) : '[]';
   db.prepare(
-    `INSERT INTO entities (id, type, scope_path, name, content, metadata, confidence, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO entities (id, type, scope_path, name, content, metadata, confidence, created_at, updated_at, memory_kind, importance, expires_at, last_accessed_at, tags)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        type = excluded.type,
        scope_path = excluded.scope_path,
@@ -202,7 +234,12 @@ export function insertEntity(db: SynapseDatabase, entity: NewEntity): boolean {
        content = excluded.content,
        metadata = excluded.metadata,
        confidence = excluded.confidence,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at,
+       memory_kind = excluded.memory_kind,
+       importance = excluded.importance,
+       expires_at = excluded.expires_at,
+       last_accessed_at = excluded.last_accessed_at,
+       tags = excluded.tags`,
   ).run(
     entity.id,
     entity.type,
@@ -211,8 +248,13 @@ export function insertEntity(db: SynapseDatabase, entity: NewEntity): boolean {
     entity.content ?? null,
     entity.metadata ? JSON.stringify(entity.metadata) : null,
     entity.confidence ?? 1.0,
-    nowMs(),
-    nowMs(),
+    now,
+    now,
+    entity.memoryKind ?? 'general',
+    entity.importance ?? 0.5,
+    entity.expiresAt ?? null,
+    entity.lastAccessedAt ?? null,
+    tags,
   );
   return exists;
 }
@@ -409,6 +451,131 @@ export function getVectors(db: SynapseDatabase, options: VectorQuery = {}): Vect
 }
 
 // ---------------------------------------------------------------------------
+// Memory deduplication
+// ---------------------------------------------------------------------------
+
+export interface SimilarMemoryHit {
+  entityId: string;
+  similarity: number;
+  memoryKind: string;
+  importance: number;
+  scopePath: string;
+  content: string | null;
+  updatedAt: number;
+}
+
+/**
+ * Find memory entries whose stored embedding is at least `threshold` similar
+ * (cosine, 0..1) to the given query embedding. Restricted to rows of type
+ * `memory_entry` so it doesn't scan code/file/symbol entities. The output is
+ * ordered by similarity descending and capped at `limit`.
+ *
+ * Linear scan: there is no ANN index on the BLOB column. Production callers
+ * should first check the sqlite-vec ANN index (when loaded) and only fall
+ * back to this function when the extension is missing.
+ */
+export function findSimilarMemories(
+  db: SynapseDatabase,
+  embedding: Float32Array,
+  threshold: number,
+  memoryKind: string | null,
+  limit: number,
+): SimilarMemoryHit[] {
+  if (embedding.length === 0) return [];
+  const norm = l2Norm(embedding);
+  if (norm === 0) return [];
+  const kindClause = memoryKind !== null ? ' AND e.memory_kind = ?' : '';
+  // No pre-score LIMIT: every eligible memory_entry vector must be scored
+  // before we sort and truncate. A LIMIT applied here would silently miss
+  // matching memories outside the arbitrary entity-ID-ordered subset.
+  const params: SqlValue[] = memoryKind !== null ? [memoryKind, Date.now()] : [Date.now()];
+  const rows = db
+    .prepare(
+      `SELECT e.id, e.memory_kind, e.importance, e.scope_path, e.content, e.updated_at, v.embedding
+       FROM entity_vectors v
+       JOIN entities e ON e.id = v.entity_id
+       WHERE e.type = 'memory_entry'${kindClause}
+         AND (e.expires_at IS NULL OR e.expires_at > ?)`,
+    )
+    .all(...params);
+  const hits: SimilarMemoryHit[] = [];
+  for (const row of rows) {
+    const other = decodeEmbedding(row['embedding']);
+    const sim = cosineSimilarity(embedding, other);
+    if (sim >= threshold) {
+      hits.push({
+        entityId: reqStr(row, 'id'),
+        similarity: sim,
+        memoryKind: String(row['memory_kind'] ?? 'general'),
+        importance: num(row, 'importance'),
+        scopePath: reqStr(row, 'scope_path'),
+        content: optStr(row, 'content'),
+        updatedAt: num(row, 'updated_at'),
+      });
+    }
+  }
+  hits.sort((a, b) => b.similarity - a.similarity);
+  return hits.slice(0, limit);
+}
+
+/**
+ * Merge two memory entries: the `loserId` is archived (its row is kept but
+ * `expires_at` is set to the epoch so retrieval filters it out), the `winnerId`
+ * keeps its content but absorbs the loser's metadata, tags, and importance. A
+ * SUPERSEDES relation is created (winner → loser) so retrieval chains can
+ * still resolve the old id. All in one transaction so a crash mid-merge
+ * cannot leave the graph in a half-merged state.
+ *
+ * The loser is archived rather than hard-deleted because `relations.target_id`
+ * uses `ON DELETE CASCADE` — a hard delete would immediately remove the
+ * SUPERSEDES history edge we just inserted. Archive keeps the FK target valid
+ * while making the row invisible to retrieval (the `expires_at IS NULL OR
+ * expires_at > ?` predicate excludes it).
+ *
+ * Returns true on success, or false if the loser is already gone (idempotent).
+ */
+export function mergeMemories(
+  db: SynapseDatabase,
+  winnerId: string,
+  loserId: string,
+): boolean {
+  if (winnerId === loserId) return false;
+  return db.transaction(() => {
+    const winner = getEntity(db, winnerId);
+    const loser = getEntity(db, loserId);
+    if (winner === undefined || loser === undefined) return false;
+    const mergedTags = Array.from(new Set([...winner.tags, ...loser.tags])).slice(0, 10);
+    const mergedImportance = Math.max(winner.importance, loser.importance);
+    const mergedScope = winner.scopePath;
+    insertEntity(db, {
+      id: winner.id,
+      type: winner.type,
+      scopePath: mergedScope,
+      name: winner.name,
+      content: winner.content,
+      metadata: { ...(winner.metadata ?? {}), ...(loser.metadata ?? {}) },
+      confidence: Math.max(winner.confidence, loser.confidence),
+      memoryKind: winner.memoryKind,
+      importance: mergedImportance,
+      expiresAt: winner.expiresAt,
+      lastAccessedAt: winner.lastAccessedAt,
+      tags: mergedTags,
+    });
+    insertRelation(db, {
+      sourceId: winnerId,
+      targetId: loserId,
+      relation: 'SUPERSEDES',
+      weight: 1.0,
+    });
+    // Archive the loser: keep the row, but set expires_at to 0 so the
+    // `expires_at > ?` filter excludes it from retrieval. The SUPERSEDES
+    // edge survives because the FK target is still present.
+    db.prepare('UPDATE entities SET expires_at = 0 WHERE id = ?').run(loserId);
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Relations / knowledge graph
 // ---------------------------------------------------------------------------
 
@@ -518,6 +685,117 @@ export function getGraphPath(
     targetType: reqStr(row, 'target_type'),
     depth: 1,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Memory entry enrichment helpers
+// ---------------------------------------------------------------------------
+
+export interface MemoryQuery {
+  scopePrefixes?: readonly string[];
+  types?: readonly string[];
+  memoryKinds?: readonly string[];
+  importanceMin?: number;
+  tags?: readonly string[];
+  includeExpired?: boolean;
+  limit?: number;
+}
+
+/**
+ * Find memory entities with optional filters for kind, importance, scope, and tags.
+ * Filters out expired entries by default unless includeExpired is true.
+ */
+export function findMemories(
+  db: SynapseDatabase,
+  options: MemoryQuery = {},
+): EntityRow[] {
+  const {
+    scopePrefixes = [],
+    types = [],
+    memoryKinds = [],
+    importanceMin,
+    tags = [],
+    includeExpired = false,
+    limit = 100,
+  } = options;
+
+  const clauses: string[] = [];
+  const params: SqlValue[] = [];
+
+  // Type filter defaults to memory_entry
+  const effectiveTypes = types.length > 0 ? types : ['memory_entry'];
+  clauses.push(`type IN (${effectiveTypes.map(() => '?').join(', ')})`);
+  for (const t of effectiveTypes) params.push(t);
+
+  // Scope prefix filtering
+  if (scopePrefixes.length > 0) {
+    pushPrefixClause('scope_path', scopePrefixes, clauses, params);
+  }
+
+  // Memory kind filter
+  if (memoryKinds.length > 0) {
+    clauses.push(`memory_kind IN (${memoryKinds.map(() => '?').join(', ')})`);
+    for (const k of memoryKinds) params.push(k);
+  }
+
+  // Importance minimum filter
+  if (importanceMin !== undefined) {
+    clauses.push('importance >= ?');
+    params.push(importanceMin);
+  }
+
+  // Tag filter (JSON array column)
+  if (tags.length > 0) {
+    for (const tag of tags) {
+      clauses.push(`tags LIKE ?`);
+      params.push(`%"${tag.replace(/"/g, '""')}"%`);
+    }
+  }
+
+  // Expiration filter
+  if (!includeExpired) {
+    const now = nowMs();
+    clauses.push(`(expires_at IS NULL OR expires_at > ?)`);
+    params.push(now);
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  params.push(limit);
+  const rows = db
+    .prepare(`SELECT * FROM entities ${where} ORDER BY importance DESC, updated_at DESC LIMIT ?`)
+    .all(...params);
+  return rows.map(entityFromRow);
+}
+
+/** Update last_accessed_at timestamp to now. */
+export function touchMemory(db: SynapseDatabase, id: string): void {
+  db.prepare('UPDATE entities SET last_accessed_at = ? WHERE id = ?').run(nowMs(), id);
+}
+
+/** Find memory entries past their expiration time. */
+export function findExpiredMemories(db: SynapseDatabase): EntityRow[] {
+  const now = nowMs();
+  const rows = db
+    .prepare(
+      `SELECT * FROM entities
+       WHERE type = 'memory_entry'
+         AND expires_at IS NOT NULL
+         AND expires_at <= ?
+       ORDER BY expires_at ASC`,
+    )
+    .all(now);
+  return rows.map(entityFromRow);
+}
+
+/** Delete all expired memory entries. Returns count of deleted rows. */
+export function deleteExpiredMemories(db: SynapseDatabase): number {
+  const expired = findExpiredMemories(db);
+  db.transaction(() => {
+    for (const entity of expired) {
+      deleteEntity(db, entity.id);
+    }
+  });
+  return expired.length;
 }
 
 // ---------------------------------------------------------------------------
